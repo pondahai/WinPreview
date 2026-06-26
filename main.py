@@ -9,13 +9,15 @@ from pathlib import Path
 import sys
 
 try:
-    from PIL import Image, ImageTk, ImageDraw
+    from PIL import Image, ImageTk, ImageDraw, ImageFont
     import fitz  # PyMuPDF
 except ImportError:
     import subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install", "PyMuPDF", "Pillow"])
-    from PIL import Image, ImageTk, ImageDraw
+    from PIL import Image, ImageTk, ImageDraw, ImageFont
     import fitz
+
+import io
 
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -72,13 +74,17 @@ class WinPreview(_Base):
         self._current_render: Image.Image | None = None
 
         # ── 標註 ──
-        self.annot_tool      = tk.StringVar(value="none")
-        self.annot_color     = "#e74c3c"
-        self.annot_width     = 2
-        self._annot_start    = None
-        self._annot_temp_id  = None
-        # 每頁獨立標註 {page_index: [(type, coords, color, width, *extra)]}
+        # 座標一律存「基底空間」：未旋轉、zoom=1.0 的頁面像素座標，
+        # 因此標註不受縮放/旋轉影響，且可正確匯出。
+        self.annot_tool        = tk.StringVar(value="none")
+        self.annot_color       = "#e74c3c"
+        self.annot_width       = 2      # 螢幕像素寬（繪製當下）
+        self._annot_start      = None   # 基底座標
+        self._annot_start_cvs  = None   # 畫布座標（橡皮筋預覽用）
+        self._annot_temp_id    = None
+        # 每頁獨立標註 {page_index: [(type, coords_base, color, width_base, *extra)]}
         self.annot_by_page: dict[int, list] = {}
+        self._font_cache: dict[int, object] = {}
 
         self._thumb_imgs: list[ImageTk.PhotoImage] = []
 
@@ -577,6 +583,30 @@ class WinPreview(_Base):
         children = self.thumb_frame.winfo_children()
         for i, child in enumerate(children):
             child.configure(bg="#555" if i == idx else "#333")
+        self._scroll_thumb_into_view(idx)
+
+    def _scroll_thumb_into_view(self, idx):
+        """讓側欄自動捲到目前頁的縮圖（主檢視 → 側欄連動）。"""
+        children = self.thumb_frame.winfo_children()
+        if not (0 <= idx < len(children)):
+            return
+        # 拖曳排序進行中就不要搶捲動
+        if getattr(self, "_td_src", None) is not None:
+            return
+        self.thumb_canvas.update_idletasks()
+        child  = children[idx]
+        total  = self.thumb_frame.winfo_height()
+        if total <= 0:
+            return
+        top    = child.winfo_y()
+        bottom = top + child.winfo_height()
+        view_h = self.thumb_canvas.winfo_height()
+        y0     = self.thumb_canvas.canvasy(0)          # 目前可視頂端
+        y1     = y0 + view_h                            # 目前可視底端
+        if top < y0:                                   # 在上方 → 對齊頂端
+            self.thumb_canvas.yview_moveto(top / total)
+        elif bottom > y1:                              # 在下方 → 對齊底端
+            self.thumb_canvas.yview_moveto(max(0, (bottom - view_h)) / total)
 
     # ── 頁面渲染 ──────────────────────────────────────────────────────────────
     def _render_page(self, page_index: int, zoom: float = None) -> Image.Image | None:
@@ -609,7 +639,11 @@ class WinPreview(_Base):
         self._current_render = img.copy()
 
         draw = ImageDraw.Draw(img)
-        self._draw_annotations(draw, img, self.cur_page)
+        W0, H0 = self._base_size(self.cur_page)
+        self._draw_annotations(
+            draw, img, self.annot_by_page.get(self.cur_page, []),
+            to_disp=lambda x, y: self._base_to_display(x, y, W0, H0),
+            scale=self.zoom)
 
         tk_img = ImageTk.PhotoImage(img)
         self.tk_image = tk_img  # 保持參考，防止 GC
@@ -633,43 +667,102 @@ class WinPreview(_Base):
         self.zoom_var.set(f"{int(self.zoom * 100)}%")
         self._highlight_thumb(self.cur_page)
 
+    # ── 座標系統 ──────────────────────────────────────────────────────────────
+    # 「基底空間」= 未旋轉、zoom=1.0 的頁面像素。PDF 在 zoom=1.0 時以 2x 點數
+    # 渲染，故基底寬高 = 點數 x 2；圖片則為原始像素。
+    def _base_size(self, page_idx: int):
+        if page_idx < 0 or page_idx >= len(self.pages):
+            return (1, 1)
+        entry = self.pages[page_idx]
+        if entry.kind == "pdf":
+            r = entry.doc[entry.page_idx].rect
+            return (max(1, int(round(r.width * 2))),
+                    max(1, int(round(r.height * 2))))
+        return (entry.pil.width, entry.pil.height)
+
+    def _base_to_display(self, x, y, W0, H0):
+        """基底座標 → 顯示影像像素（含目前旋轉與縮放）。"""
+        r = self.rotation
+        if   r == 90:  bx, by = H0 - y, x
+        elif r == 180: bx, by = W0 - x, H0 - y
+        elif r == 270: bx, by = y, W0 - x
+        else:          bx, by = x, y
+        return bx * self.zoom, by * self.zoom
+
+    def _display_to_base(self, dx, dy, W0, H0):
+        """顯示影像像素 → 基底座標（_base_to_display 的反運算）。"""
+        x, y = dx / self.zoom, dy / self.zoom
+        r = self.rotation
+        if   r == 90:  return y, H0 - x
+        elif r == 180: return W0 - x, H0 - y
+        elif r == 270: return W0 - y, x
+        return x, y
+
+    def _canvas_to_base(self, cx, cy):
+        if self._canvas_img_id is None or self._current_render is None:
+            return cx, cy
+        x0, y0 = self.canvas.coords(self._canvas_img_id)
+        iw, ih = self._current_render.size
+        dx = cx - (x0 - iw / 2)
+        dy = cy - (y0 - ih / 2)
+        W0, H0 = self._base_size(self.cur_page)
+        return self._display_to_base(dx, dy, W0, H0)
+
+    def _font(self, size: int):
+        size = max(6, int(size))
+        if size in self._font_cache:
+            return self._font_cache[size]
+        font = None
+        for path in (r"C:\Windows\Fonts\msjh.ttc",   # 微軟正黑（支援中文）
+                     r"C:\Windows\Fonts\simsun.ttc",
+                     r"C:\Windows\Fonts\arial.ttf"):
+            try:
+                font = ImageFont.truetype(path, size)
+                break
+            except Exception:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+        self._font_cache[size] = font
+        return font
+
     # ── 標註繪製 ──────────────────────────────────────────────────────────────
     @property
     def annotations(self) -> list:
         return self.annot_by_page.setdefault(self.cur_page, [])
 
-    def _draw_annotations(self, draw, img, page_idx):
-        for annot in self.annot_by_page.get(page_idx, []):
-            t, coords, color, width, *extra = annot
+    def _draw_annotations(self, draw, img, annots, to_disp, scale):
+        """以 to_disp(基底→目標影像像素) 與 scale(寬度比例) 繪製標註。"""
+        for annot in annots:
+            t, coords, color, wbase, *extra = annot
+            w = max(1, int(round(wbase * scale)))
+            pts = [to_disp(x, y) for (x, y) in coords]
             if t == "pen":
-                for j in range(len(coords) - 1):
-                    draw.line([coords[j], coords[j+1]], fill=color, width=width)
+                if len(pts) > 1:
+                    draw.line(pts, fill=color, width=w, joint="curve")
             elif t == "line":
-                draw.line(coords, fill=color, width=width)
-            elif t == "rect":
-                draw.rectangle(coords, outline=color, width=width)
-            elif t == "oval":
-                draw.ellipse(coords, outline=color, width=width)
-            elif t == "highlight":
-                overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-                od = ImageDraw.Draw(overlay)
-                r, g, b = self._hex_to_rgb(color)
-                od.rectangle(coords, fill=(r, g, b, 100))
-                merged = Image.alpha_composite(
-                    img.convert("RGBA"), overlay).convert("RGB")
-                img.paste(merged)
+                if len(pts) >= 2:
+                    draw.line(pts, fill=color, width=w)
+            elif t in ("rect", "oval", "highlight"):
+                xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                box = [min(xs), min(ys), max(xs), max(ys)]
+                if t == "rect":
+                    draw.rectangle(box, outline=color, width=w)
+                elif t == "oval":
+                    draw.ellipse(box, outline=color, width=w)
+                else:  # highlight：半透明填色
+                    r, g, b = self._hex_to_rgb(color)
+                    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+                    ImageDraw.Draw(overlay).rectangle(box, fill=(r, g, b, 110))
+                    merged = Image.alpha_composite(img.convert("RGBA"), overlay)
+                    img.paste(merged.convert(img.mode))
             elif t == "text":
-                txt = extra[0] if extra else ""
-                draw.text(coords[0], txt, fill=color)
+                txt   = extra[0] if extra else ""
+                tbase = extra[1] if len(extra) > 1 else 16
+                draw.text(pts[0], txt, fill=color,
+                          font=self._font(round(tbase * scale)))
 
     # ── 標註事件 ──────────────────────────────────────────────────────────────
-    def _canvas_to_img(self, cx, cy):
-        if self._canvas_img_id is None or self._current_render is None:
-            return cx, cy
-        x0, y0 = self.canvas.coords(self._canvas_img_id)
-        iw, ih  = self._current_render.size
-        return int(cx - (x0 - iw // 2)), int(cy - (y0 - ih // 2))
-
     def _on_press(self, event):
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
@@ -678,17 +771,20 @@ class WinPreview(_Base):
             self._drag_start = (cx, cy)
             self.canvas.configure(cursor="fleur")
             return
-        px, py = self._canvas_to_img(cx, cy)
-        self._annot_start = (px, py)
+        bx, by = self._canvas_to_base(cx, cy)
+        self._annot_start     = (bx, by)
+        self._annot_start_cvs = (cx, cy)
         if tool == "pen":
-            self._pen_points = [(px, py)]
+            self._pen_points = [(bx, by)]
         elif tool == "text":
             txt = simpledialog.askstring("文字標註", "輸入文字：")
             if txt:
                 self.annotations.append(
-                    ("text", [(px, py)], self.annot_color,
-                     self.annot_width, txt))
+                    ("text", [(bx, by)], self.annot_color,
+                     self.annot_width / max(self.zoom, 1e-6), txt,
+                     16 / max(self.zoom, 1e-6)))
                 self._render()
+            self._annot_start = None
 
     def _on_drag(self, event):
         cx = self.canvas.canvasx(event.x)
@@ -703,32 +799,24 @@ class WinPreview(_Base):
             return
         if self._annot_start is None:
             return
-        px, py = self._canvas_to_img(cx, cy)
         if tool == "pen":
-            self._pen_points.append((px, py))
+            self._pen_points.append(self._canvas_to_base(cx, cy))
             self._render()
         elif tool in ("line", "rect", "oval", "highlight"):
+            # 橡皮筋預覽直接用畫布座標，省去往返換算
             if self._annot_temp_id:
                 self.canvas.delete(self._annot_temp_id)
-            sx, sy = self._annot_start
-            if self._canvas_img_id and self._current_render:
-                x0, y0 = self.canvas.coords(self._canvas_img_id)
-                iw, ih = self._current_render.size
-                ox, oy = x0 - iw // 2, y0 - ih // 2
-                c1x, c1y = sx + ox, sy + oy
-                c2x, c2y = px + ox, py + oy
-            else:
-                c1x, c1y, c2x, c2y = sx, sy, cx, cy
+            c1x, c1y = self._annot_start_cvs
             kw = dict(outline=self.annot_color, width=self.annot_width, dash=(4, 2))
             if tool in ("rect", "highlight"):
                 self._annot_temp_id = self.canvas.create_rectangle(
-                    c1x, c1y, c2x, c2y, **kw)
+                    c1x, c1y, cx, cy, **kw)
             elif tool == "oval":
                 self._annot_temp_id = self.canvas.create_oval(
-                    c1x, c1y, c2x, c2y, **kw)
+                    c1x, c1y, cx, cy, **kw)
             elif tool == "line":
                 self._annot_temp_id = self.canvas.create_line(
-                    c1x, c1y, c2x, c2y, fill=self.annot_color,
+                    c1x, c1y, cx, cy, fill=self.annot_color,
                     width=self.annot_width, dash=(4, 2))
 
     def _on_release(self, event):
@@ -743,15 +831,15 @@ class WinPreview(_Base):
         if self._annot_temp_id:
             self.canvas.delete(self._annot_temp_id)
             self._annot_temp_id = None
-        px, py = self._canvas_to_img(cx, cy)
-        sx, sy = self._annot_start
+        wbase = self.annot_width / max(self.zoom, 1e-6)
         if tool == "pen":
             if len(self._pen_points) > 1:
                 self.annotations.append(
-                    ("pen", self._pen_points, self.annot_color, self.annot_width))
+                    ("pen", list(self._pen_points), self.annot_color, wbase))
         elif tool in ("line", "rect", "oval", "highlight"):
+            bx, by = self._canvas_to_base(cx, cy)
             self.annotations.append(
-                (tool, [(sx, sy), (px, py)], self.annot_color, self.annot_width))
+                (tool, [self._annot_start, (bx, by)], self.annot_color, wbase))
         self._annot_start = None
         self._render()
 
@@ -859,51 +947,76 @@ class WinPreview(_Base):
         if path:
             self._save_cur_page_as_image(Path(path))
 
+    @staticmethod
+    def _png_bytes(img: Image.Image) -> bytes:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def _render_annot_overlay(self, page_idx: int) -> Image.Image | None:
+        """產生一張基底大小、未旋轉的透明 PNG，只含該頁標註。"""
+        annots = self.annot_by_page.get(page_idx, [])
+        if not annots:
+            return None
+        W0, H0 = self._base_size(page_idx)
+        overlay = Image.new("RGBA", (W0, H0), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        # 基底空間 → 基底空間（identity），標註以原始比例繪製
+        self._draw_annotations(draw, overlay, annots,
+                               to_disp=lambda x, y: (x, y), scale=1.0)
+        return overlay
+
     def _export_all_as_pdf(self, out_path: Path):
+        """匯出所有頁面；PDF 頁保留向量文字，標註以透明圖層疊加。"""
         try:
             doc = fitz.open()
             for i, entry in enumerate(self.pages):
+                overlay = self._render_annot_overlay(i)
                 if entry.kind == "pdf":
-                    src_page = entry.doc[entry.page_idx]
-                    new_page = doc.new_page(width=src_page.rect.width,
-                                            height=src_page.rect.height)
+                    pr = entry.doc[entry.page_idx].rect
+                    new_page = doc.new_page(width=pr.width, height=pr.height)
+                    # 向量複製，保留可選取文字
                     new_page.show_pdf_page(new_page.rect, entry.doc, entry.page_idx)
                 else:
-                    img = entry.pil.copy()
+                    img = entry.pil
                     if img.mode != "RGB":
                         img = img.convert("RGB")
-                    buf = __import__("io").BytesIO()
-                    img.save(buf, format="PNG")
                     new_page = doc.new_page(width=img.width, height=img.height)
-                    new_page.insert_image(new_page.rect, stream=buf.getvalue())
-                # 疊加標註（簡易版：寫入 fitz 原生標註）
-                for annot in self.annot_by_page.get(i, []):
-                    t, coords, color, width, *extra = annot
-                    r, g, b = [c/255 for c in self._hex_to_rgb(color)]
-                    try:
-                        if t == "rect":
-                            x0,y0=coords[0]; x1,y1=coords[1]
-                            sc = new_page.rect.width / (self._render_page(i, zoom=1.0) or type('x',(),{'size':(new_page.rect.width*2,1)})()).size[0]
-                            a = new_page.add_rect_annot(
-                                fitz.Rect(x0*sc,y0*sc,x1*sc,y1*sc))
-                            a.set_colors(stroke=(r,g,b)); a.update()
-                    except Exception:
-                        pass
-            doc.save(str(out_path))
+                    new_page.insert_image(new_page.rect,
+                                          stream=self._png_bytes(img))
+                if overlay is not None:
+                    # 透明標註圖層疊在頁面上方（底下文字仍可見/可選）
+                    new_page.insert_image(new_page.rect,
+                                          stream=self._png_bytes(overlay),
+                                          overlay=True, keep_proportion=False)
+            doc.save(str(out_path), garbage=3, deflate=True)
             doc.close()
             self._update_status(f"已匯出 PDF：{out_path}（{len(self.pages)} 頁）")
         except Exception as e:
             messagebox.showerror("匯出失敗", str(e))
 
     def _save_cur_page_as_image(self, path: Path):
+        """匯出目前頁為圖片（含旋轉與標註，zoom=1.0 解析度）。"""
         try:
             img = self._render_page(self.cur_page, zoom=1.0)
             if img is None:
                 return
             if img.mode != "RGB":
                 img = img.convert("RGB")
+            W0, H0 = self._base_size(self.cur_page)
+            rot = self.rotation
+
+            def to_disp(x, y):
+                if   rot == 90:  bx, by = H0 - y, x
+                elif rot == 180: bx, by = W0 - x, H0 - y
+                elif rot == 270: bx, by = y, W0 - x
+                else:            bx, by = x, y
+                return bx, by  # zoom=1.0
+
             draw = ImageDraw.Draw(img)
-            self._draw_annotations(draw, img, self.cur_page)
+            self._draw_annotations(
+                draw, img, self.annot_by_page.get(self.cur_page, []),
+                to_disp=to_disp, scale=1.0)
             img.save(str(path))
             self._update_status(f"已儲存：{path}")
         except Exception as e:
