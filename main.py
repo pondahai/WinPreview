@@ -10,12 +10,13 @@ import sys
 
 try:
     from PIL import Image, ImageTk, ImageDraw, ImageFont
-    import fitz  # PyMuPDF
+    import pypdfium2 as pdfium  # PDF 渲染（Apache/BSD，取代 PyMuPDF）
 except ImportError:
     import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "PyMuPDF", "Pillow"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install",
+                           "pypdfium2", "Pillow"])
     from PIL import Image, ImageTk, ImageDraw, ImageFont
-    import fitz
+    import pypdfium2 as pdfium
 
 import io
 
@@ -37,7 +38,7 @@ ANNOT_COLORS = ["#e74c3c", "#e67e22", "#f1c40f", "#2ecc71",
                 "#3498db", "#9b59b6", "#1abc9c", "#000000"]
 
 # ── 頁面描述子 ────────────────────────────────────────────────────────────────
-# 每個元素是 {"type": "pdf"|"img", "doc": fitz.Document, "page": int}
+# 每個元素是 {"type": "pdf"|"img", "doc": pdfium.PdfDocument, "page": int}
 #                                    或 {"type": "img", "pil": PIL.Image}
 class PageEntry:
     """輕量描述子，指向一個 PDF 頁或一張圖片。"""
@@ -45,7 +46,7 @@ class PageEntry:
 
     def __init__(self, *, kind, doc=None, page_idx=0, pil=None, source_path=None):
         self.kind        = kind         # "pdf" | "img"
-        self.doc         = doc          # fitz.Document（PDF 用）
+        self.doc         = doc          # pdfium.PdfDocument（PDF 用）
         self.page_idx    = page_idx     # PDF 頁碼
         self.pil         = pil          # PIL.Image（圖片用）
         self.source_path = source_path  # 原始檔案路徑
@@ -64,7 +65,8 @@ class WinPreview(_Base):
 
         # ── 核心狀態：頁面清單 ──
         self.pages: list[PageEntry] = []   # 所有頁面，支援累加
-        self._open_docs: list[fitz.Document] = []  # 保持開啟的 fitz doc
+        self._open_docs: list = []         # 保持開啟的 pdfium PdfDocument
+        self._size_cache: dict = {}        # (id(doc), page_idx) → (W0, H0) 基底尺寸
         self.cur_page   = 0                # 目前頁面索引
         self.zoom       = 1.0
         self.rotation   = 0               # 0/90/180/270
@@ -76,15 +78,25 @@ class WinPreview(_Base):
         # ── 標註 ──
         # 座標一律存「基底空間」：未旋轉、zoom=1.0 的頁面像素座標，
         # 因此標註不受縮放/旋轉影響，且可正確匯出。
+        self._selected_annot   = None   # 選取中的標註索引（select 工具）
         self.annot_tool        = tk.StringVar(value="none")
+        self.annot_tool.trace_add("write", self._on_tool_change)
         self.annot_color       = "#e74c3c"
         self.annot_width       = 2      # 螢幕像素寬（繪製當下）
         self._annot_start      = None   # 基底座標
         self._annot_start_cvs  = None   # 畫布座標（橡皮筋預覽用）
         self._annot_temp_id    = None
+        # 拖曳搬移選取標註用
+        self._move_start_base  = None   # 按下時的基底座標
+        self._move_orig_coords = None   # 被搬移標註的原始座標（供計算與復原）
+        self._moving           = False
         # 每頁獨立標註 {page_index: [(type, coords_base, color, width_base, *extra)]}
         self.annot_by_page: dict[int, list] = {}
         self._font_cache: dict[int, object] = {}
+        # 復原堆疊：記錄標註動作以供 Ctrl+Z 回退
+        #   ("add",   page)            → 移除該頁最後一筆標註
+        #   ("clear", page, old_list)  → 還原整頁標註
+        self._undo_stack: list = []
 
         self._thumb_imgs: list[ImageTk.PhotoImage] = []
 
@@ -140,7 +152,8 @@ class WinPreview(_Base):
 
         tm = tk.Menu(mb, tearoff=False)
         mb.add_cascade(label="工具", menu=tm)
-        for label, val in [("選取／捲動", "none"), ("畫筆", "pen"),
+        for label, val in [("平移／捲動", "none"), ("選取標註", "select"),
+                            ("畫筆", "pen"),
                             ("直線", "line"), ("矩形", "rect"),
                             ("橢圓", "oval"), ("文字", "text"),
                             ("螢光筆", "highlight")]:
@@ -181,7 +194,7 @@ class WinPreview(_Base):
         btn("↻ 右", lambda: self._rotate(90))
         sep()
 
-        tools = [("✋", "none"), ("✏", "pen"), ("─", "line"),
+        tools = [("✋", "none"), ("▣", "select"), ("✏", "pen"), ("─", "line"),
                  ("▭", "rect"), ("◯", "oval"), ("T", "text"), ("🖊", "highlight")]
         for label, val in tools:
             rb = tk.Radiobutton(tb, text=label, variable=self.annot_tool,
@@ -271,6 +284,8 @@ class WinPreview(_Base):
         self.bind("<Control-1>",     lambda e: self._zoom_actual())
         self.bind("<Control-l>",     lambda e: self._rotate(-90))
         self.bind("<Control-r>",     lambda e: self._rotate(90))
+        self.bind("<Control-z>",     lambda e: self._undo())
+        self.bind("<Control-Z>",     lambda e: self._undo())
         self.bind("<Prior>",         lambda e: self._prev_page())
         self.bind("<Next>",          lambda e: self._next_page())
         self.bind("<Left>",          lambda e: self._prev_page())
@@ -283,6 +298,9 @@ class WinPreview(_Base):
         c.bind("<MouseWheel>",         self._on_scroll)
         c.bind("<Control-MouseWheel>", self._on_ctrl_scroll)
         c.bind("<Configure>",          lambda e: self._render())
+        c.configure(takefocus=True)
+        c.bind("<Delete>",             lambda e: self._delete_selected())
+        c.bind("<BackSpace>",          lambda e: self._delete_selected())
 
         if _HAS_DND:
             # 主視窗與畫布都接受拖放 → 累加
@@ -346,7 +364,7 @@ class WinPreview(_Base):
         inserted = 0
         if ext in PDF_EXT:
             try:
-                doc = fitz.open(str(path))
+                doc = pdfium.PdfDocument(str(path))
                 self._open_docs.append(doc)
                 for pi in range(len(doc)):
                     self.pages.append(PageEntry(
@@ -392,8 +410,11 @@ class WinPreview(_Base):
             except Exception:
                 pass
         self._open_docs.clear()
+        self._size_cache.clear()
         self.pages.clear()
         self.annot_by_page.clear()
+        self._undo_stack.clear()
+        self._selected_annot = None
         self.cur_page = 0
         self.img_offset = [0, 0]
         self.canvas.delete("all")
@@ -415,6 +436,8 @@ class WinPreview(_Base):
             return
         del self.pages[self.cur_page]
         self.annot_by_page.pop(self.cur_page, None)
+        self._undo_stack.clear()   # 頁碼重編，舊復原紀錄會失準
+        self._selected_annot = None
         # 重新編號標註
         new_annot = {}
         for k, v in self.annot_by_page.items():
@@ -519,6 +542,7 @@ class WinPreview(_Base):
             return  # 沒有移動
 
         # 重新排列 pages
+        self._undo_stack.clear()   # 頁碼重編，舊復原紀錄會失準
         page = self.pages.pop(src)
         annot = self.annot_by_page.pop(src, [])
 
@@ -616,9 +640,13 @@ class WinPreview(_Base):
         entry = self.pages[page_index]
         if entry.kind == "pdf":
             page = entry.doc[entry.page_idx]
-            mat  = fitz.Matrix(z * 2, z * 2).prerotate(self.rotation)
-            pix  = page.get_pixmap(matrix=mat, alpha=False)
-            return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            try:
+                # scale = 點數→像素倍率；維持「zoom=1.0 時 2x 點數」的基底慣例
+                bitmap = page.render(scale=z * 2, rotation=self.rotation)
+                img = bitmap.to_pil()
+                return img.convert("RGB") if img.mode != "RGB" else img
+            finally:
+                page.close()
         else:  # img
             img = entry.pil.copy()
             if self.rotation:
@@ -640,10 +668,21 @@ class WinPreview(_Base):
 
         draw = ImageDraw.Draw(img)
         W0, H0 = self._base_size(self.cur_page)
-        self._draw_annotations(
-            draw, img, self.annot_by_page.get(self.cur_page, []),
-            to_disp=lambda x, y: self._base_to_display(x, y, W0, H0),
-            scale=self.zoom)
+        to_disp = lambda x, y: self._base_to_display(x, y, W0, H0)
+        annots = self.annot_by_page.get(self.cur_page, [])
+        self._draw_annotations(draw, img, annots, to_disp=to_disp, scale=self.zoom)
+
+        # 選取框（僅 select 工具、且選取索引有效時繪製，不會匯出）
+        if (self.annot_tool.get() == "select"
+                and self._selected_annot is not None
+                and 0 <= self._selected_annot < len(annots)):
+            x0, y0, x1, y1 = self._annot_bbox(annots[self._selected_annot])
+            # 轉換四角再取範圍（含旋轉時軸向會交換）
+            pts = [to_disp(x0, y0), to_disp(x1, y0), to_disp(x1, y1), to_disp(x0, y1)]
+            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+            m = 4  # 外擴邊距（顯示像素）
+            draw.rectangle([min(xs) - m, min(ys) - m, max(xs) + m, max(ys) + m],
+                           outline="#00a8ff", width=2)
 
         tk_img = ImageTk.PhotoImage(img)
         self.tk_image = tk_img  # 保持參考，防止 GC
@@ -675,9 +714,18 @@ class WinPreview(_Base):
             return (1, 1)
         entry = self.pages[page_idx]
         if entry.kind == "pdf":
-            r = entry.doc[entry.page_idx].rect
-            return (max(1, int(round(r.width * 2))),
-                    max(1, int(round(r.height * 2))))
+            key = (id(entry.doc), entry.page_idx)
+            cached = self._size_cache.get(key)
+            if cached is not None:
+                return cached
+            page = entry.doc[entry.page_idx]
+            try:
+                w, h = page.get_size()  # 點數
+            finally:
+                page.close()
+            size = (max(1, int(round(w * 2))), max(1, int(round(h * 2))))
+            self._size_cache[key] = size
+            return size
         return (entry.pil.width, entry.pil.height)
 
     def _base_to_display(self, x, y, W0, H0):
@@ -764,6 +812,7 @@ class WinPreview(_Base):
 
     # ── 標註事件 ──────────────────────────────────────────────────────────────
     def _on_press(self, event):
+        self.canvas.focus_set()   # 讓 Delete/BackSpace 鍵有效
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
         tool = self.annot_tool.get()
@@ -772,6 +821,19 @@ class WinPreview(_Base):
             self.canvas.configure(cursor="fleur")
             return
         bx, by = self._canvas_to_base(cx, cy)
+        if tool == "select":
+            idx = self._hit_test(bx, by)
+            self._selected_annot = idx
+            self._move_start_base = None
+            self._move_orig_coords = None
+            self._moving = False
+            if idx is not None:
+                annots = self.annot_by_page.get(self.cur_page, [])
+                self._move_orig_coords = list(annots[idx][1])  # 原始座標複本
+                self._move_start_base = (bx, by)
+                self.canvas.configure(cursor="fleur")
+            self._render()
+            return
         self._annot_start     = (bx, by)
         self._annot_start_cvs = (cx, cy)
         if tool == "pen":
@@ -783,6 +845,8 @@ class WinPreview(_Base):
                     ("text", [(bx, by)], self.annot_color,
                      self.annot_width / max(self.zoom, 1e-6), txt,
                      16 / max(self.zoom, 1e-6)))
+                self._undo_stack.append(
+                    ("add", self.cur_page, self.annotations[-1]))
                 self._render()
             self._annot_start = None
 
@@ -795,6 +859,23 @@ class WinPreview(_Base):
                 self.img_offset[0] += cx - self._drag_start[0]
                 self.img_offset[1] += cy - self._drag_start[1]
                 self._drag_start = (cx, cy)
+                self._render()
+            return
+        if tool == "select":
+            if self._selected_annot is None or self._move_start_base is None:
+                return
+            bx, by = self._canvas_to_base(cx, cy)
+            dx = bx - self._move_start_base[0]
+            dy = by - self._move_start_base[1]
+            if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+                self._moving = True
+            annots = self.annot_by_page.get(self.cur_page, [])
+            i = self._selected_annot
+            if 0 <= i < len(annots):
+                # 每次都從原始座標重算，避免累積誤差
+                new_coords = [(x + dx, y + dy) for (x, y) in self._move_orig_coords]
+                a = annots[i]
+                annots[i] = (a[0], new_coords, *a[2:])
                 self._render()
             return
         if self._annot_start is None:
@@ -825,6 +906,17 @@ class WinPreview(_Base):
         tool = self.annot_tool.get()
         self.canvas.configure(cursor="crosshair")
         self._drag_start = None
+        if tool == "select":
+            if (self._moving and self._selected_annot is not None
+                    and self._move_orig_coords is not None):
+                self._undo_stack.append(
+                    ("move", self.cur_page, self._selected_annot,
+                     self._move_orig_coords))
+                self._update_status("已移動標註（Ctrl+Z 可復原）")
+            self._move_start_base = None
+            self._move_orig_coords = None
+            self._moving = False
+            return
         if tool == "none" or self._annot_start is None:
             self._annot_start = None
             return
@@ -836,10 +928,14 @@ class WinPreview(_Base):
             if len(self._pen_points) > 1:
                 self.annotations.append(
                     ("pen", list(self._pen_points), self.annot_color, wbase))
+                self._undo_stack.append(
+                    ("add", self.cur_page, self.annotations[-1]))
         elif tool in ("line", "rect", "oval", "highlight"):
             bx, by = self._canvas_to_base(cx, cy)
             self.annotations.append(
                 (tool, [self._annot_start, (bx, by)], self.annot_color, wbase))
+            self._undo_stack.append(
+                ("add", self.cur_page, self.annotations[-1]))
         self._annot_start = None
         self._render()
 
@@ -887,6 +983,7 @@ class WinPreview(_Base):
         if 0 <= idx < len(self.pages):
             self.cur_page = idx
             self.img_offset = [0, 0]
+            self._selected_annot = None
             self._render()
 
     def _prev_page(self): self._go_page(self.cur_page - 1)
@@ -902,8 +999,111 @@ class WinPreview(_Base):
             self.annot_color = c[1]
 
     def _clear_annotations(self):
-        self.annot_by_page.pop(self.cur_page, None)
+        old = self.annot_by_page.pop(self.cur_page, None)
+        if old:
+            self._undo_stack.append(("clear", self.cur_page, old))
+        self._selected_annot = None
         self._render()
+
+    def _undo(self):
+        """Ctrl+Z：回退最近一次標註動作（新增 / 刪除 / 清除整頁）。"""
+        if not self._undo_stack:
+            self._update_status("沒有可復原的動作")
+            return
+        action = self._undo_stack.pop()
+        kind, page = action[0], action[1]
+        if kind == "add":                      # 復原新增 → 依物件移除
+            obj = action[2]
+            lst = self.annot_by_page.get(page)
+            if lst:
+                for i in range(len(lst) - 1, -1, -1):
+                    if lst[i] is obj:
+                        del lst[i]
+                        break
+                if not lst:
+                    self.annot_by_page.pop(page, None)
+        elif kind == "del":                    # 復原刪除 → 插回原位
+            _, page, idx, obj = action
+            lst = self.annot_by_page.setdefault(page, [])
+            lst.insert(min(idx, len(lst)), obj)
+        elif kind == "move":                   # 復原搬移 → 還原座標
+            _, page, idx, old_coords = action
+            lst = self.annot_by_page.get(page)
+            if lst and 0 <= idx < len(lst):
+                a = lst[idx]
+                lst[idx] = (a[0], old_coords, *a[2:])
+        elif kind == "clear":                  # 復原整頁清除
+            self.annot_by_page[page] = action[2]
+        self._selected_annot = None
+        # 切到受影響的頁面再重畫，讓使用者看到復原結果
+        if page != self.cur_page and 0 <= page < len(self.pages):
+            self._go_page(page)
+        else:
+            self._render()
+        self._update_status("已復原")
+
+    # ── 標註選取 / 刪除 ────────────────────────────────────────────────────────
+    def _on_tool_change(self, *_):
+        """切換工具時取消選取，避免殘留選取框。"""
+        if self._selected_annot is not None:
+            self._selected_annot = None
+            self._render()
+
+    @staticmethod
+    def _point_seg_dist(px, py, ax, ay, bx, by):
+        """點 (px,py) 到線段 AB 的距離。"""
+        dx, dy = bx - ax, by - ay
+        if dx == 0 and dy == 0:
+            return ((px - ax) ** 2 + (py - ay) ** 2) ** 0.5
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+        cx, cy = ax + t * dx, ay + t * dy
+        return ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+
+    def _annot_bbox(self, annot):
+        """回傳標註在基底座標的外接框 (x0, y0, x1, y1)。"""
+        t, coords = annot[0], annot[1]
+        xs = [p[0] for p in coords]; ys = [p[1] for p in coords]
+        if t == "text":
+            txt   = annot[4] if len(annot) > 4 else ""
+            tbase = annot[5] if len(annot) > 5 else 16
+            x, y = coords[0]
+            return (x, y, x + max(1, len(txt)) * tbase * 0.6, y + tbase)
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    def _hit_test(self, bx, by):
+        """傳回基底座標 (bx,by) 命中的標註索引（由上層往下找），沒有則 None。"""
+        annots = self.annot_by_page.get(self.cur_page, [])
+        tol = max(4.0, 6.0 / max(self.zoom, 1e-6))   # 容許誤差（基底單位）
+        for i in range(len(annots) - 1, -1, -1):     # 後畫的在上層，優先命中
+            annot = annots[i]
+            t, coords = annot[0], annot[1]
+            if t in ("pen", "line"):
+                hit = any(
+                    self._point_seg_dist(bx, by, coords[j][0], coords[j][1],
+                                         coords[j + 1][0], coords[j + 1][1]) <= tol
+                    for j in range(len(coords) - 1))
+            else:  # rect / oval / highlight / text → 外接框內即命中
+                x0, y0, x1, y1 = self._annot_bbox(annot)
+                hit = (x0 - tol <= bx <= x1 + tol) and (y0 - tol <= by <= y1 + tol)
+            if hit:
+                return i
+        return None
+
+    def _delete_selected(self):
+        if self.annot_tool.get() != "select" or self._selected_annot is None:
+            return
+        lst = self.annot_by_page.get(self.cur_page)
+        idx = self._selected_annot
+        if not lst or not (0 <= idx < len(lst)):
+            self._selected_annot = None
+            return
+        obj = lst.pop(idx)
+        self._undo_stack.append(("del", self.cur_page, idx, obj))
+        if not lst:
+            self.annot_by_page.pop(self.cur_page, None)
+        self._selected_annot = None
+        self._render()
+        self._update_status("已刪除標註（Ctrl+Z 可復原）")
 
     # ── 儲存 / 匯出 ───────────────────────────────────────────────────────────
     def _cmd_save(self):
@@ -947,12 +1147,6 @@ class WinPreview(_Base):
         if path:
             self._save_cur_page_as_image(Path(path))
 
-    @staticmethod
-    def _png_bytes(img: Image.Image) -> bytes:
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
-
     def _render_annot_overlay(self, page_idx: int) -> Image.Image | None:
         """產生一張基底大小、未旋轉的透明 PNG，只含該頁標註。"""
         annots = self.annot_by_page.get(page_idx, [])
@@ -966,31 +1160,73 @@ class WinPreview(_Base):
                                to_disp=lambda x, y: (x, y), scale=1.0)
         return overlay
 
+    @staticmethod
+    def _overlay_to_page(overlay: Image.Image, w: float, h: float):
+        """把一張 RGBA 標註圖轉成 w×h 點的單頁 PDF（保留透明度）。"""
+        from pypdf import PdfReader
+        from reportlab.pdfgen import canvas as rl_canvas
+        from reportlab.lib.utils import ImageReader
+        buf = io.BytesIO()
+        c = rl_canvas.Canvas(buf, pagesize=(w, h))
+        # mask='auto'：reportlab 依 alpha 自動建立 SMask，底下內容（文字）保持可見
+        c.drawImage(ImageReader(overlay), 0, 0, width=w, height=h, mask="auto")
+        c.showPage()
+        c.save()
+        buf.seek(0)
+        return PdfReader(buf).pages[0]
+
+    @staticmethod
+    def _image_to_page(img: Image.Image, overlay, w: float, h: float):
+        """把整頁圖片（+選用標註層）轉成 w×h 點的單頁 PDF。"""
+        from pypdf import PdfReader
+        from reportlab.pdfgen import canvas as rl_canvas
+        from reportlab.lib.utils import ImageReader
+        buf = io.BytesIO()
+        c = rl_canvas.Canvas(buf, pagesize=(w, h))
+        c.drawImage(ImageReader(img), 0, 0, width=w, height=h)
+        if overlay is not None:
+            c.drawImage(ImageReader(overlay), 0, 0, width=w, height=h, mask="auto")
+        c.showPage()
+        c.save()
+        buf.seek(0)
+        return PdfReader(buf).pages[0]
+
     def _export_all_as_pdf(self, out_path: Path):
-        """匯出所有頁面；PDF 頁保留向量文字，標註以透明圖層疊加。"""
+        """匯出所有頁面；PDF 頁直接複製原頁（保留可選取文字），標註以透明圖層疊加。"""
         try:
-            doc = fitz.open()
+            from pypdf import PdfReader, PdfWriter
+        except ImportError:
+            messagebox.showerror(
+                "缺少套件", "匯出 PDF 需要 pypdf 與 reportlab：\n"
+                "pip install pypdf reportlab")
+            return
+        try:
+            writer = PdfWriter()
+            reader_cache: dict[str, "PdfReader"] = {}
             for i, entry in enumerate(self.pages):
                 overlay = self._render_annot_overlay(i)
                 if entry.kind == "pdf":
-                    pr = entry.doc[entry.page_idx].rect
-                    new_page = doc.new_page(width=pr.width, height=pr.height)
-                    # 向量複製，保留可選取文字
-                    new_page.show_pdf_page(new_page.rect, entry.doc, entry.page_idx)
+                    src = str(entry.source_path)
+                    reader = reader_cache.get(src)
+                    if reader is None:
+                        reader = PdfReader(src)
+                        reader_cache[src] = reader
+                    page = reader.pages[entry.page_idx]   # 原頁，文字/向量原封不動
+                    if overlay is not None:
+                        box = page.mediabox
+                        ov = self._overlay_to_page(
+                            overlay, float(box.width), float(box.height))
+                        page.merge_page(ov)               # 標註疊在原頁上方
+                    writer.add_page(page)
                 else:
                     img = entry.pil
-                    if img.mode != "RGB":
+                    if img.mode not in ("RGB", "RGBA"):
                         img = img.convert("RGB")
-                    new_page = doc.new_page(width=img.width, height=img.height)
-                    new_page.insert_image(new_page.rect,
-                                          stream=self._png_bytes(img))
-                if overlay is not None:
-                    # 透明標註圖層疊在頁面上方（底下文字仍可見/可選）
-                    new_page.insert_image(new_page.rect,
-                                          stream=self._png_bytes(overlay),
-                                          overlay=True, keep_proportion=False)
-            doc.save(str(out_path), garbage=3, deflate=True)
-            doc.close()
+                    # 沿用舊行為：圖片像素數 = PDF 點數（1px = 1pt）
+                    page = self._image_to_page(img, overlay, img.width, img.height)
+                    writer.add_page(page)
+            with open(out_path, "wb") as f:
+                writer.write(f)
             self._update_status(f"已匯出 PDF：{out_path}（{len(self.pages)} 頁）")
         except Exception as e:
             messagebox.showerror("匯出失敗", str(e))

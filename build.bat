@@ -1,11 +1,13 @@
 @echo off
 REM 打包 WinPreview 為單一 exe
 REM --collect-all tkinterdnd2 是關鍵：確保拖放用的 tkdnd 原生檔被打包進去
-REM PyMuPDF 自帶 PyInstaller hook，不需 --collect-all（會把整包塞進去）
+REM pypdfium2 自帶 PyInstaller hook（會打包 pdfium 原生庫，體積遠小於 PyMuPDF）
 REM --exclude-module 排除共用環境中不相干的大型套件，避免 exe 爆肥
 echo 開始打包 WinPreview...
-pyinstaller --noconfirm --windowed --onefile --name WinPreview ^
+python -m PyInstaller --noconfirm --windowed --onefile --name WinPreview ^
     --collect-all tkinterdnd2 ^
+    --exclude-module PyMuPDF ^
+    --exclude-module fitz ^
     --exclude-module pygame ^
     --exclude-module numpy ^
     --exclude-module scipy ^
