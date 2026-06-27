@@ -47,6 +47,31 @@ build.bat
 產出 `dist\WinPreview.exe`（單一檔、免安裝）。打包腳本已用
 `--collect-all tkinterdnd2` 確保拖放在 exe 中正常運作。
 
+> 兩種打包形式：`--onefile`（單一 exe，最簡潔）或 `--onedir`（可攜資料夾，
+> 防毒誤報機率較低）。Release 同時提供這兩種下載，見下方說明。
+
+## ⚠️ 防毒誤報 Antivirus false positive
+
+下載單一檔 `WinPreview.exe` 時，Windows Defender 可能回報
+**`Trojan:Win32/Wacatac.B!ml`**。這是**誤報**：
+
+- 結尾 `!ml` 代表是 Defender 的**機器學習啟發式**判斷，而非已知病毒特徵碼。
+- `Wacatac.B!ml` 是「**未簽章的 PyInstaller 單檔 exe**」最常見的誤報標籤；本程式以
+  `--onefile` 打包，因「單檔自我解壓」行為被啟發式誤判。原始碼公開，可用
+  [VirusTotal](https://www.virustotal.com/) 自行比對。
+
+**兩種因應方式：**
+
+1. **改下載可攜資料夾版（`--onedir`，zip）**：Release 另提供解壓即用的資料夾版，
+   誤報機率低很多。解壓後雙擊裡面的 `WinPreview.exe` 即可，一樣免安裝。
+2. **保留單一 exe 並加白名單**（Windows 安全性）：
+   - **還原**：Windows 安全性 → 病毒與威脅防護 → 保護歷程記錄 → 找到項目 → 還原 / 允許。
+   - **排除**：病毒與威脅防護 → 管理設定 → 排除項目 → 新增檔案 / 資料夾。
+   - **PowerShell（系統管理員）**：`Add-MpPreference -ExclusionPath "C:\路徑\WinPreview.exe"`
+
+> 以上白名單只對你自己的電腦有效。根本解法是為執行檔加上**程式碼簽章
+> （Authenticode）**，未來版本將評估導入。
+
 ## ⌨️ 快捷鍵 Shortcuts
 
 | 按鍵 | 功能 |
