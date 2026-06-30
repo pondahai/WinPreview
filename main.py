@@ -502,10 +502,21 @@ class WinPreview(_Base):
         self._td_src: int | None = None   # 拖曳起始頁索引
         self._td_drop_line = None         # thumb_canvas 上的插入線 id
 
+        # 縮圖統一框進固定方框，避免寬圖/長頁撐爆側欄版面
+        thumb_w = max(40, SIDEBAR_W - 34)   # 目標寬度（扣掉捲軸與邊距）
+        thumb_h = 150                        # 目標高度上限
         for i in range(min(len(self.pages), 300)):
-            img = self._render_page(i, zoom=0.12)
+            bw, bh = self._base_size(i)
+            if self.rotation in (90, 270):
+                bw, bh = bh, bw
+            # 取寬、高兩個限制中較小的縮放，確保兩個方向都不超框
+            z = min(thumb_w / max(bw, 1), thumb_h / max(bh, 1))
+            img = self._render_page(i, zoom=z)
             if img is None:
                 continue
+            # 保險：若仍超出（捨入誤差）再夾一次
+            if img.width > thumb_w or img.height > thumb_h:
+                img.thumbnail((thumb_w, thumb_h), Image.LANCZOS)
             tk_img = ImageTk.PhotoImage(img)
             self._thumb_imgs.append(tk_img)
 
