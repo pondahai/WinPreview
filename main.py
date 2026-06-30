@@ -8,10 +8,22 @@ from tkinter import ttk, filedialog, messagebox, colorchooser, simpledialog
 from pathlib import Path
 import sys
 
+# 是否為 PyInstaller 等打包後的凍結環境
+_FROZEN = getattr(sys, "frozen", False)
+
 try:
     from PIL import Image, ImageTk, ImageDraw, ImageFont
     import pypdfium2 as pdfium  # PDF 渲染（Apache/BSD，取代 PyMuPDF）
-except ImportError:
+except ImportError as _e:
+    if _FROZEN:
+        # 打包後 sys.executable 就是本程式；切勿用它自我重啟安裝套件，
+        # 否則會無限自我複製（程序炸彈）。缺元件就直接報錯結束。
+        import tkinter as _tk
+        from tkinter import messagebox as _mb
+        _root = _tk.Tk(); _root.withdraw()
+        _mb.showerror("WinPreview 無法啟動",
+                      f"缺少必要元件：{_e}\n此為打包檔損毀，請重新下載。")
+        sys.exit(1)
     import subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install",
                            "pypdfium2", "Pillow"])

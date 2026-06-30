@@ -6,6 +6,10 @@ REM --exclude-module 排除共用環境中不相干的大型套件，避免 exe 
 echo 開始打包 WinPreview...
 python -m PyInstaller --noconfirm --windowed --onefile --name WinPreview ^
     --collect-all tkinterdnd2 ^
+    --collect-all pypdfium2 ^
+    --collect-all pypdfium2_raw ^
+    --collect-all pypdf ^
+    --collect-all reportlab ^
     --exclude-module PyMuPDF ^
     --exclude-module fitz ^
     --exclude-module pygame ^
