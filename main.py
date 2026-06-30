@@ -75,6 +75,17 @@ class WinPreview(_Base):
         self._canvas_img_id  = None
         self._current_render: Image.Image | None = None
 
+        # ── 檢視模式 ──
+        self.view_mode = tk.StringVar(value="single")   # single | continuous
+        self._cont_gap    = 16             # 連續模式頁間距（畫布像素）
+        self._cont_margin = 20
+        self._cont_layout: list[dict] = [] # 每頁版面 {idx,x,y,w,h}（內容座標）
+        self._cont_items:  dict[int, tuple] = {}  # idx -> (image_id, PhotoImage)
+        self._cont_frames: list[int] = []  # 頁框矩形 id
+        self._cont_content = (0, 0)        # (寬, 高)
+        self._cont_pending = False         # 重繪可見頁去抖動旗標
+        self._annot_page  = None           # 標註中目標頁（連續模式）
+
         # ── 標註 ──
         # 座標一律存「基底空間」：未旋轉、zoom=1.0 的頁面像素座標，
         # 因此標註不受縮放/旋轉影響，且可正確匯出。
@@ -142,6 +153,11 @@ class WinPreview(_Base):
 
         vm = tk.Menu(mb, tearoff=False)
         mb.add_cascade(label="顯示", menu=vm)
+        vm.add_radiobutton(label="單頁顯示", variable=self.view_mode,
+                           value="single", command=self._on_view_mode_change)
+        vm.add_radiobutton(label="連續顯示", variable=self.view_mode,
+                           value="continuous", command=self._on_view_mode_change)
+        vm.add_separator()
         vm.add_command(label="放大\tCtrl++",     command=self._zoom_in)
         vm.add_command(label="縮小\tCtrl+-",     command=self._zoom_out)
         vm.add_command(label="符合視窗\tCtrl+0", command=self._zoom_fit)
@@ -189,6 +205,14 @@ class WinPreview(_Base):
         btn("🔍+", self._zoom_in)
         btn("🔍-", self._zoom_out)
         btn("⊡ 符合", self._zoom_fit)
+        sep()
+        # 檢視模式：單頁 / 連續
+        for label, val in [("▤ 單頁", "single"), ("☰ 連續", "continuous")]:
+            tk.Radiobutton(tb, text=label, variable=self.view_mode, value=val,
+                           indicator=0, relief="flat", bg=TOOLBAR_BG,
+                           activebackground="#ddd", selectcolor="#c8e6c9",
+                           padx=5, pady=4, font=("Segoe UI", 9), cursor="hand2",
+                           command=self._on_view_mode_change).pack(side="left", padx=1)
         sep()
         btn("↺ 左", lambda: self._rotate(-90))
         btn("↻ 右", lambda: self._rotate(90))
@@ -420,6 +444,9 @@ class WinPreview(_Base):
         self.canvas.delete("all")
         self._canvas_img_id = None
         self._current_render = None
+        self._cont_items.clear()
+        self._cont_frames.clear()
+        self._cont_layout = []
         for w in self.thumb_frame.winfo_children():
             w.destroy()
         self._thumb_imgs.clear()
@@ -656,12 +683,23 @@ class WinPreview(_Base):
             return img.resize((w, h), Image.LANCZOS)
 
     def _render(self):
+        if self.view_mode.get() == "continuous":
+            self._render_continuous()
+        else:
+            self._render_single()
+
+    def _render_single(self):
         if not self.pages:
             return
+        # 清掉連續模式殘留
+        if self._cont_items or self._cont_frames:
+            self.canvas.delete("all")
+            self._cont_items.clear()
+            self._cont_frames.clear()
+            self._canvas_img_id = None
         img = self._render_page(self.cur_page)
         if img is None:
             return
-        # 確保 RGB
         if img.mode != "RGB":
             img = img.convert("RGB")
         self._current_render = img.copy()
@@ -705,6 +743,137 @@ class WinPreview(_Base):
             text=f"{self.cur_page + 1} / {total}" if total > 0 else "")
         self.zoom_var.set(f"{int(self.zoom * 100)}%")
         self._highlight_thumb(self.cur_page)
+
+    # ── 連續顯示模式 ──────────────────────────────────────────────────────────
+    def _disp_size(self, page_idx: int):
+        """該頁在目前縮放/旋轉下的顯示尺寸（畫布像素）。"""
+        W0, H0 = self._base_size(page_idx)
+        if self.rotation in (90, 270):
+            W0, H0 = H0, W0
+        return max(1, int(W0 * self.zoom)), max(1, int(H0 * self.zoom))
+
+    def _cont_build_layout(self):
+        """只計算幾何（不渲染），決定每頁在畫布上的位置。"""
+        self._cont_layout = []
+        m, gap = self._cont_margin, self._cont_gap
+        sizes = [self._disp_size(i) for i in range(len(self.pages))]
+        content_w = (max((w for w, _ in sizes), default=0)) + 2 * m
+        cw = self.canvas.winfo_width() or 800
+        content_w = max(content_w, cw)
+        y = m
+        for i, (w, h) in enumerate(sizes):
+            x = (content_w - w) // 2
+            self._cont_layout.append({"idx": i, "x": x, "y": y, "w": w, "h": h})
+            y += h + gap
+        content_h = y - gap + m if sizes else 0
+        self._cont_content = (content_w, max(content_h, 1))
+
+    def _render_continuous(self):
+        if not self.pages:
+            return
+        self.canvas.delete("all")
+        self._cont_items.clear()
+        self._cont_frames.clear()
+        self._canvas_img_id = None
+        self._current_render = None
+
+        self._cont_build_layout()
+        cw, ch = self._cont_content
+        self.canvas.configure(scrollregion=(0, 0, cw, ch))
+
+        # 先畫每頁的頁框（佔位，捲到才填影像）
+        for e in self._cont_layout:
+            fid = self.canvas.create_rectangle(
+                e["x"], e["y"], e["x"] + e["w"], e["y"] + e["h"],
+                outline="#555", width=1, fill="#3a3a3a")
+            self._cont_frames.append(fid)
+
+        self._cont_refresh_visible()
+        self.zoom_var.set(f"{int(self.zoom * 100)}%")
+        self._cont_update_curpage()
+
+    def _cont_visible_range(self):
+        top = self.canvas.canvasy(0)
+        vh  = self.canvas.winfo_height() or 600
+        bot = top + vh
+        buf = vh                      # 預先渲染上下各一個視窗高度
+        return top - buf, bot + buf
+
+    def _cont_refresh_visible(self):
+        if self.view_mode.get() != "continuous" or not self._cont_layout:
+            return
+        lo, hi = self._cont_visible_range()
+        want = set()
+        for e in self._cont_layout:
+            if e["y"] + e["h"] >= lo and e["y"] <= hi:
+                want.add(e["idx"])
+                if e["idx"] not in self._cont_items:
+                    self._cont_render_one(e)
+        # 釋放離開視窗太遠的頁，控制記憶體
+        for idx in list(self._cont_items):
+            if idx not in want:
+                img_id, _ = self._cont_items.pop(idx)
+                self.canvas.delete(img_id)
+
+    def _cont_render_one(self, e: dict):
+        img = self._render_page(e["idx"])
+        if img is None:
+            return
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        draw = ImageDraw.Draw(img)
+        W0, H0 = self._base_size(e["idx"])
+        self._draw_annotations(
+            draw, img, self.annot_by_page.get(e["idx"], []),
+            to_disp=lambda x, y: self._base_to_display(x, y, W0, H0),
+            scale=self.zoom)
+        photo = ImageTk.PhotoImage(img)
+        img_id = self.canvas.create_image(e["x"], e["y"], anchor="nw", image=photo)
+        self._cont_items[e["idx"]] = (img_id, photo)
+
+    def _cont_update_curpage(self):
+        """依捲動位置推算目前頁（視窗中央落在哪一頁）。"""
+        if not self._cont_layout:
+            return
+        mid = self.canvas.canvasy(0) + (self.canvas.winfo_height() or 600) / 2
+        best, bestd = self.cur_page, None
+        for e in self._cont_layout:
+            c = e["y"] + e["h"] / 2
+            d = abs(c - mid)
+            if bestd is None or d < bestd:
+                bestd, best = d, e["idx"]
+        if best != self.cur_page:
+            self.cur_page = best
+        total = len(self.pages)
+        self.page_label.configure(text=f"{self.cur_page + 1} / {total}")
+        self._highlight_thumb(self.cur_page)
+
+    def _cont_redraw_page(self, idx: int):
+        """重畫單一頁（標註變動後）。"""
+        if idx in self._cont_items:
+            img_id, _ = self._cont_items.pop(idx)
+            self.canvas.delete(img_id)
+        for e in self._cont_layout:
+            if e["idx"] == idx:
+                self._cont_render_one(e)
+                break
+
+    def _on_view_mode_change(self):
+        self.img_offset = [0, 0]
+        if self.view_mode.get() == "continuous":
+            # 進入連續模式：符合頁寬，再捲到目前頁
+            self._zoom_fit()
+            self._cont_scroll_to_page(self.cur_page)
+        else:
+            self._render()
+
+    def _cont_scroll_to_page(self, idx):
+        for e in self._cont_layout:
+            if e["idx"] == idx:
+                _, ch = self._cont_content
+                self.canvas.yview_moveto(max(0, e["y"] - self._cont_margin) / ch)
+                self._cont_refresh_visible()
+                break
 
     # ── 座標系統 ──────────────────────────────────────────────────────────────
     # 「基底空間」= 未旋轉、zoom=1.0 的頁面像素。PDF 在 zoom=1.0 時以 2x 點數
@@ -755,6 +924,21 @@ class WinPreview(_Base):
         dy = cy - (y0 - ih / 2)
         W0, H0 = self._base_size(self.cur_page)
         return self._display_to_base(dx, dy, W0, H0)
+
+    def _cont_page_at(self, cx, cy):
+        """連續模式：找出 (cx,cy) 落在哪一頁的版面，回傳該 layout entry。"""
+        for e in self._cont_layout:
+            if e["x"] <= cx <= e["x"] + e["w"] and e["y"] <= cy <= e["y"] + e["h"]:
+                return e
+        return None
+
+    def _canvas_to_base_for(self, idx, cx, cy):
+        """連續模式：把畫布座標換成指定頁的基底座標。"""
+        e = next((e for e in self._cont_layout if e["idx"] == idx), None)
+        if e is None:
+            return (cx, cy)
+        W0, H0 = self._base_size(idx)
+        return self._display_to_base(cx - e["x"], cy - e["y"], W0, H0)
 
     def _font(self, size: int):
         size = max(6, int(size))
@@ -811,16 +995,47 @@ class WinPreview(_Base):
                           font=self._font(round(tbase * scale)))
 
     # ── 標註事件 ──────────────────────────────────────────────────────────────
+    def _annot_target_list(self):
+        """目前標註要寫入的清單（依模式選頁）。"""
+        idx = self._annot_page if self._annot_page is not None else self.cur_page
+        return self.annot_by_page.setdefault(idx, [])
+
+    def _map_to_target(self, cx, cy):
+        """畫布座標 → 目標頁基底座標（單頁/連續通用）。"""
+        if self.view_mode.get() == "continuous":
+            return self._canvas_to_base_for(self._annot_page, cx, cy)
+        return self._canvas_to_base(cx, cy)
+
+    def _redraw_after_annot(self):
+        if self.view_mode.get() == "continuous":
+            self._cont_redraw_page(
+                self._annot_page if self._annot_page is not None else self.cur_page)
+        else:
+            self._render()
+
     def _on_press(self, event):
         self.canvas.focus_set()   # 讓 Delete/BackSpace 鍵有效
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
         tool = self.annot_tool.get()
+        cont = self.view_mode.get() == "continuous"
         if tool == "none":
             self._drag_start = (cx, cy)
             self.canvas.configure(cursor="fleur")
+            if cont:
+                self.canvas.scan_mark(event.x, event.y)
             return
-        bx, by = self._canvas_to_base(cx, cy)
+        # 決定目標頁（連續模式下為游標所在頁）
+        if cont:
+            e = self._cont_page_at(cx, cy)
+            if e is None:
+                self._annot_start = None
+                return
+            self._annot_page = e["idx"]
+            self.cur_page = e["idx"]
+        else:
+            self._annot_page = self.cur_page
+        bx, by = self._map_to_target(cx, cy)
         if tool == "select":
             idx = self._hit_test(bx, by)
             self._selected_annot = idx
@@ -832,7 +1047,7 @@ class WinPreview(_Base):
                 self._move_orig_coords = list(annots[idx][1])  # 原始座標複本
                 self._move_start_base = (bx, by)
                 self.canvas.configure(cursor="fleur")
-            self._render()
+            self._redraw_after_annot()
             return
         self._annot_start     = (bx, by)
         self._annot_start_cvs = (cx, cy)
@@ -841,30 +1056,36 @@ class WinPreview(_Base):
         elif tool == "text":
             txt = simpledialog.askstring("文字標註", "輸入文字：")
             if txt:
-                self.annotations.append(
+                self._annot_target_list().append(
                     ("text", [(bx, by)], self.annot_color,
                      self.annot_width / max(self.zoom, 1e-6), txt,
                      16 / max(self.zoom, 1e-6)))
                 self._undo_stack.append(
                     ("add", self.cur_page, self.annotations[-1]))
-                self._render()
+                self._redraw_after_annot()
             self._annot_start = None
 
     def _on_drag(self, event):
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
         tool = self.annot_tool.get()
+        cont = self.view_mode.get() == "continuous"
         if tool == "none":
             if self._drag_start:
-                self.img_offset[0] += cx - self._drag_start[0]
-                self.img_offset[1] += cy - self._drag_start[1]
-                self._drag_start = (cx, cy)
-                self._render()
+                if cont:
+                    self.canvas.scan_dragto(event.x, event.y, gain=1)
+                    self._cont_refresh_visible()
+                    self._cont_update_curpage()
+                else:
+                    self.img_offset[0] += cx - self._drag_start[0]
+                    self.img_offset[1] += cy - self._drag_start[1]
+                    self._drag_start = (cx, cy)
+                    self._render()
             return
         if tool == "select":
             if self._selected_annot is None or self._move_start_base is None:
                 return
-            bx, by = self._canvas_to_base(cx, cy)
+            bx, by = self._map_to_target(cx, cy)   # 連續模式對應正確頁
             dx = bx - self._move_start_base[0]
             dy = by - self._move_start_base[1]
             if abs(dx) > 1e-6 or abs(dy) > 1e-6:
@@ -876,15 +1097,15 @@ class WinPreview(_Base):
                 new_coords = [(x + dx, y + dy) for (x, y) in self._move_orig_coords]
                 a = annots[i]
                 annots[i] = (a[0], new_coords, *a[2:])
-                self._render()
+                self._redraw_after_annot()
             return
         if self._annot_start is None:
             return
         if tool == "pen":
-            self._pen_points.append(self._canvas_to_base(cx, cy))
-            self._render()
+            self._pen_points.append(self._map_to_target(cx, cy))
+            self._redraw_after_annot()
         elif tool in ("line", "rect", "oval", "highlight"):
-            # 橡皮筋預覽直接用畫布座標，省去往返換算
+            # 橡皮筋預覽直接用畫布座標
             if self._annot_temp_id:
                 self.canvas.delete(self._annot_temp_id)
             c1x, c1y = self._annot_start_cvs
@@ -926,65 +1147,91 @@ class WinPreview(_Base):
         wbase = self.annot_width / max(self.zoom, 1e-6)
         if tool == "pen":
             if len(self._pen_points) > 1:
-                self.annotations.append(
+                self._annot_target_list().append(
                     ("pen", list(self._pen_points), self.annot_color, wbase))
                 self._undo_stack.append(
                     ("add", self.cur_page, self.annotations[-1]))
         elif tool in ("line", "rect", "oval", "highlight"):
-            bx, by = self._canvas_to_base(cx, cy)
-            self.annotations.append(
+            bx, by = self._map_to_target(cx, cy)
+            self._annot_target_list().append(
                 (tool, [self._annot_start, (bx, by)], self.annot_color, wbase))
             self._undo_stack.append(
                 ("add", self.cur_page, self.annotations[-1]))
+        self._redraw_after_annot()
         self._annot_start = None
-        self._render()
+        self._annot_page  = None
 
     def _on_scroll(self, event):
-        if len(self.pages) > 1:
+        if self.view_mode.get() == "continuous":
+            _, ch = self._cont_content
+            if ch > 1:
+                step = -event.delta / 120 * 90 / ch   # 每格約 90px
+                top  = self.canvas.canvasy(0) / ch
+                self.canvas.yview_moveto(min(max(top + step, 0), 1))
+                self._cont_refresh_visible()
+                self._cont_update_curpage()
+        elif len(self.pages) > 1:
             self._next_page() if event.delta < 0 else self._prev_page()
 
     def _on_ctrl_scroll(self, event):
         self._zoom_in() if event.delta > 0 else self._zoom_out()
 
     # ── 縮放 / 旋轉 / 頁面 ───────────────────────────────────────────────────
-    def _zoom_in(self):
-        self.zoom = min(self.zoom * 1.25, 20.0)
+    def _post_zoom(self):
+        """套用縮放後重繪；連續模式維持目前頁在視窗內。"""
         self.img_offset = [0, 0]
         self._render()
+        if self.view_mode.get() == "continuous":
+            self._cont_scroll_to_page(self.cur_page)
+
+    def _zoom_in(self):
+        self.zoom = min(self.zoom * 1.25, 20.0)
+        self._post_zoom()
 
     def _zoom_out(self):
         self.zoom = max(self.zoom / 1.25, 0.05)
-        self.img_offset = [0, 0]
-        self._render()
+        self._post_zoom()
 
     def _zoom_fit(self):
         self.update_idletasks()
-        cw = self.canvas.winfo_width()  or 800
-        ch = self.canvas.winfo_height() or 600
-        img = self._render_page(self.cur_page, zoom=1.0)
-        if img is None:
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        if cw <= 1 or ch <= 1:        # 視窗尚未配置好，稍後再試
+            self.after(60, self._zoom_fit)
             return
-        iw, ih = img.size
-        self.zoom = max(0.05, min((cw - 40) / max(iw, 1),
-                                  (ch - 40) / max(ih, 1)))
-        self.img_offset = [0, 0]
-        self._render()
+        W0, H0 = self._base_size(self.cur_page)
+        if self.rotation in (90, 270):
+            W0, H0 = H0, W0
+        if self.view_mode.get() == "continuous":
+            # 連續模式：符合頁寬
+            self.zoom = max(0.05, (cw - 2 * self._cont_margin) / max(W0, 1))
+        else:
+            self.zoom = max(0.05, min((cw - 40) / max(W0, 1),
+                                      (ch - 40) / max(H0, 1)))
+        self._post_zoom()
 
     def _zoom_actual(self):
         self.zoom = 1.0
-        self.img_offset = [0, 0]
-        self._render()
+        self._post_zoom()
 
     def _rotate(self, deg):
         self.rotation = (self.rotation + deg) % 360
         self._render()
+        if self.view_mode.get() == "continuous":
+            self._cont_scroll_to_page(self.cur_page)
 
     def _go_page(self, idx):
         if 0 <= idx < len(self.pages):
             self.cur_page = idx
             self.img_offset = [0, 0]
             self._selected_annot = None
-            self._render()
+            if self.view_mode.get() == "continuous":
+                self._cont_scroll_to_page(idx)
+                total = len(self.pages)
+                self.page_label.configure(text=f"{idx + 1} / {total}")
+                self._highlight_thumb(idx)
+            else:
+                self._render()
 
     def _prev_page(self): self._go_page(self.cur_page - 1)
     def _next_page(self): self._go_page(self.cur_page + 1)
