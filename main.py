@@ -379,7 +379,7 @@ class WinPreview(_Base):
             self._clear_all_pages()
             for p in paths:
                 self._append_file(Path(p))
-            self._mark_saved()
+            self._mark_opened([Path(p) for p in paths])
 
     def _cmd_append(self):
         paths = filedialog.askopenfilenames(
@@ -397,7 +397,7 @@ class WinPreview(_Base):
         """命令列呼叫用：清空後開啟單一檔案。"""
         self._clear_all_pages()
         self._append_file(path)
-        self._mark_saved()
+        self._mark_opened([path])
 
     # ── 核心：累加頁面 ────────────────────────────────────────────────────────
     def _append_file(self, path: Path):
@@ -1760,6 +1760,15 @@ class WinPreview(_Base):
     def _mark_saved(self):
         self._saved_sig = self._doc_signature()
         self._refresh_title()
+
+    def _mark_opened(self, paths: list[Path]):
+        """剛開啟的檔案：只有「單一個 PDF」本身就是存好的文件，算未修改；
+        圖片或多個檔案組成的文件還沒存成 PDF，關閉時要提醒。"""
+        if len(paths) == 1 and paths[0].suffix.lower() in PDF_EXT:
+            self._mark_saved()
+        else:
+            self._saved_sig = ()
+            self._refresh_title()
 
     def _refresh_title(self):
         t = ("*" if self._is_dirty() else "") + self._title_base
