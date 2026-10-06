@@ -70,7 +70,8 @@ _Base = TkinterDnD.Tk if _HAS_DND else tk.Tk
 class WinPreview(_Base):
     def __init__(self):
         super().__init__()
-        self.title("WinPreview")
+        self._title_base = "WinPreview"
+        self.title(self._title_base)
         self.geometry("1100x750")
         self.minsize(700, 500)
         self.configure(bg="#2b2b2b")
@@ -321,6 +322,9 @@ class WinPreview(_Base):
         self.bind("<Control-l>",     lambda e: self._rotate(-90))
         self.bind("<Control-r>",     lambda e: self._rotate(90))
         self.bind("<Control-z>",     lambda e: self._undo())
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._saved_sig = self._doc_signature()
+        self._poll_dirty()
         self.bind("<Control-Z>",     lambda e: self._undo())
         self.bind("<Prior>",         lambda e: self._prev_page())
         self.bind("<Next>",          lambda e: self._next_page())
@@ -370,9 +374,12 @@ class WinPreview(_Base):
                        ("圖片", "*.jpg *.jpeg *.png *.gif *.bmp *.tiff *.webp"),
                        ("所有檔案", "*.*")])
         if paths:
+            if not self._confirm_discard():
+                return
             self._clear_all_pages()
             for p in paths:
                 self._append_file(Path(p))
+            self._mark_saved()
 
     def _cmd_append(self):
         paths = filedialog.askopenfilenames(
@@ -390,6 +397,7 @@ class WinPreview(_Base):
         """命令列呼叫用：清空後開啟單一檔案。"""
         self._clear_all_pages()
         self._append_file(path)
+        self._mark_saved()
 
     # ── 核心：累加頁面 ────────────────────────────────────────────────────────
     def _append_file(self, path: Path):
@@ -435,7 +443,7 @@ class WinPreview(_Base):
 
         self._rebuild_thumbs()
         self._zoom_fit()
-        self.title(f"WinPreview — {path.name}  [{len(self.pages)} 頁]")
+        self._title_base = f"WinPreview — {path.name}  [{len(self.pages)} 頁]"
         self._update_status(f"已加入 {inserted} 頁來自 {path.name}，共 {len(self.pages)} 頁")
 
     # ── 清空 ─────────────────────────────────────────────────────────────────
@@ -465,32 +473,82 @@ class WinPreview(_Base):
         self.page_label.configure(text="")
 
     def _cmd_clear_all(self):
-        if messagebox.askyesno("確認", "清空所有頁面？"):
-            self._clear_all_pages()
-            self.title("WinPreview")
-            self._update_status("就緒")
+        if self._is_dirty():
+            if not self._confirm_discard():
+                return
+        elif not messagebox.askyesno("確認", "清空所有頁面？"):
+            return
+        self._clear_all_pages()
+        self._title_base = "WinPreview"
+        self._mark_saved()
+        self._update_status("就緒")
 
     def _remove_cur_page(self):
+        """刪除選取的頁面（沒有多選時就是目前頁）；多頁刪除合併成一筆復原。"""
         if not self.pages:
             return
-        del self.pages[self.cur_page]
-        self.annot_by_page.pop(self.cur_page, None)
-        self._undo_stack.clear()   # 頁碼重編，舊復原紀錄會失準
+        sel = sorted(self._sel_pages(), reverse=True)   # 由後往前刪，索引不會跑掉
+        for idx in sel:
+            self._delete_page_core(idx)
+        if len(sel) > 1:
+            self._undo_stack.append(("group", len(sel)))
+        self.cur_page = min(sel[-1], max(0, len(self.pages) - 1))
+        self._sel = {self.cur_page} if self.pages else set()
+        self._sel_anchor = self.cur_page
         self._selected_annot = None
-        # 重新編號標註
-        new_annot = {}
-        for k, v in self.annot_by_page.items():
-            new_k = k if k < self.cur_page else k - 1
-            new_annot[new_k] = v
-        self.annot_by_page = new_annot
-        self.cur_page = min(self.cur_page, max(0, len(self.pages) - 1))
         self._rebuild_thumbs()
         if self.pages:
             self._render()
+            self._update_status(
+                f"已刪除第 {sel[0]+1} 頁（Ctrl+Z 可復原）" if len(sel) == 1
+                else f"已刪除 {len(sel)} 頁（Ctrl+Z 可復原）")
         else:
             self.canvas.delete("all")
             self._canvas_img_id = None
             self._update_status("已清空")
+
+    def _delete_page_core(self, idx: int):
+        page = self.pages.pop(idx)
+        annot = self.annot_by_page.pop(idx, None)
+        # 重新編號標註
+        self.annot_by_page = {(k if k < idx else k - 1): v
+                              for k, v in self.annot_by_page.items()}
+        # 指向被刪頁的復原紀錄先收起來（連同在堆疊中的位置），復原刪除時放回
+        saved = [(i, a) for i, a in enumerate(self._undo_stack)
+                 if self._undo_refs_page(a, idx)]
+        self._undo_stack = [a for a in self._undo_stack
+                            if not self._undo_refs_page(a, idx)]
+        self._remap_undo(lambda i: i if i < idx else i - 1)
+        # 插回位置記成「原本接在哪一頁之前」（頁面物件），不受之後頁碼變動影響
+        nxt = self.pages[idx] if idx < len(self.pages) else None
+        self._undo_stack.append(("delpage", nxt, page, annot, saved))
+
+    # ── 側欄多選 ─────────────────────────────────────────────────────────────
+    def _sel_pages(self) -> set[int]:
+        """目前選取的頁（過濾無效索引；沒有選取時以目前頁代替）。"""
+        sel = {i for i in getattr(self, "_sel", set()) if 0 <= i < len(self.pages)}
+        return sel or ({self.cur_page} if self.pages else set())
+
+    def _thumb_click(self, idx: int, state: int):
+        ctrl, shift = state & 0x4, state & 0x1
+        if shift:                                   # Shift：從錨點選到這頁
+            a = getattr(self, "_sel_anchor", self.cur_page)
+            rng = set(range(min(a, idx), max(a, idx) + 1))
+            self._sel = (self._sel_pages() | rng) if ctrl else rng
+        elif ctrl:                                  # Ctrl：加入 / 移除單頁
+            sel = self._sel_pages()
+            sel ^= {idx}
+            self._sel = sel or {idx}
+            self._sel_anchor = idx
+        else:                                       # 一般點擊：只選這頁
+            self._sel = {idx}
+            self._sel_anchor = idx
+        if idx in self._sel:
+            self._go_page(idx)
+        self._highlight_thumb(self.cur_page)
+        n = len(self._sel)
+        if n > 1:
+            self._update_status(f"已選取 {n} 頁（拖曳可一起移動，Delete 一起刪除）")
 
     # ── 縮圖 ─────────────────────────────────────────────────────────────────
     def _rebuild_thumbs(self):
@@ -500,7 +558,13 @@ class WinPreview(_Base):
 
         # 拖曳排序狀態（共用於所有縮圖）
         self._td_src: int | None = None   # 拖曳起始頁索引
-        self._td_drop_line = None         # thumb_canvas 上的插入線 id
+        self._td_target: int | None = None  # 目前插入點（空位所在）
+        self._td_mids: list[float] = []   # 拖曳開始時各縮圖中線 y
+        self._td_gap = 0                  # 空位高度
+        self._td_pads: dict[int, tuple[float, float]] = {}
+        if getattr(self, "_td_anim", None) is not None:
+            self.after_cancel(self._td_anim)
+        self._td_anim = None
 
         # 縮圖統一框進固定方框，避免寬圖/長頁撐爆側欄版面
         thumb_w = max(40, SIDEBAR_W - 34)   # 目標寬度（扣掉捲軸與邊距）
@@ -522,7 +586,7 @@ class WinPreview(_Base):
 
             frame = tk.Frame(self.thumb_frame, bg="#333", cursor="hand2")
             frame.pack(pady=3, padx=4)
-            lbl = tk.Label(frame, image=tk_img, bg="#444", relief="flat", bd=1)
+            lbl = tk.Label(frame, image=tk_img, bg="#444", relief="flat", bd=2)
             lbl.pack()
             src = self.pages[i].source_path
             name = src.stem[:10] if src else ""
@@ -541,12 +605,25 @@ class WinPreview(_Base):
         # thumb_canvas 也要接 motion/release，防止滑鼠滑出縮圖區時失去事件
         self.thumb_canvas.bind("<B1-Motion>",       lambda e: self._thumb_motion(e))
         self.thumb_canvas.bind("<ButtonRelease-1>", lambda e: self._thumb_release(e))
+        # 滾輪捲動：縮圖、標籤、底層 frame/canvas 都要綁，否則只有捲軸能滾
+        for w in (self.thumb_canvas, self.thumb_frame,
+                  *self.thumb_frame.winfo_children()):
+            for ww in (w, *w.winfo_children()):
+                ww.bind("<MouseWheel>", self._thumb_wheel)
         # DEL 鍵刪除目前頁（需 focus）
         self.thumb_canvas.configure(takefocus=True)
         self.thumb_canvas.bind("<Delete>",          lambda e: self._remove_cur_page())
 
+    def _thumb_wheel(self, event):
+        # 內容比可視區短時不捲動，避免縮圖被捲出頂端
+        if self.thumb_frame.winfo_height() > self.thumb_canvas.winfo_height():
+            self.thumb_canvas.yview_scroll(int(-event.delta / 120) or
+                                           (-1 if event.delta > 0 else 1), "units")
+        return "break"
+
     def _thumb_press(self, event, idx: int):
         self._td_src      = idx
+        self._td_state    = event.state
         self._td_moved    = False
         self._td_press_y  = event.y_root
         self.thumb_canvas.focus_set()   # 讓 DEL 鍵有效
@@ -555,8 +632,21 @@ class WinPreview(_Base):
         if self._td_src is None:
             return
         # 超過 4px 才算拖曳（避免誤觸）
-        if abs(event.y_root - self._td_press_y) > 4:
+        if not self._td_moved and abs(event.y_root - self._td_press_y) > 4:
             self._td_moved = True
+            # 拖曳開始：抓的是已選取的頁 → 整批一起拖；否則只拖這一頁
+            sel = self._sel_pages()
+            self._td_block = sorted(sel) if self._td_src in sel else [self._td_src]
+            # 記下原始位置、空位高度（整批高度，上限 3 格），並淡化來源縮圖
+            self._snapshot_thumb_mids()
+            children = self.thumb_frame.winfo_children()
+            hs = [children[i].winfo_height() + self._THUMB_PAD
+                  for i in self._td_block if i < len(children)]
+            self._td_gap = sum(sorted(hs)[:3])
+            for i in self._td_block:
+                if i < len(children):
+                    for w in (children[i], *children[i].winfo_children()):
+                        w.configure(bg="#2a2a2a")
         if not self._td_moved:
             return
         self.thumb_canvas.configure(cursor="sb_v_double_arrow")
@@ -564,14 +654,10 @@ class WinPreview(_Base):
         # 計算滑鼠在 thumb_canvas 中的 y（考慮捲動）
         cy = self.thumb_canvas.canvasy(
             event.y_root - self.thumb_canvas.winfo_rooty())
-        target = self._thumb_index_at_y(cy)
-        self._draw_drop_line(target)
+        self._set_thumb_target(self._thumb_index_at_y(cy))
 
     def _thumb_release(self, event):
         self.thumb_canvas.configure(cursor="")
-        if self._td_drop_line:
-            self.thumb_canvas.delete(self._td_drop_line)
-            self._td_drop_line = None
 
         if self._td_src is None:
             return
@@ -579,84 +665,181 @@ class WinPreview(_Base):
         self._td_src = None
 
         if not self._td_moved:
-            # 純點擊 → 選頁
-            self._go_page(src)
+            # 純點擊 → 選頁（支援 Ctrl / Shift）
+            self._thumb_click(src, self._td_state)
             return
 
-        # 計算放下位置
-        cy = self.thumb_canvas.canvasy(
-            event.y_root - self.thumb_canvas.winfo_rooty())
-        dst = self._thumb_index_at_y(cy)
+        block = self._td_block
+        dst = self._td_target if self._td_target is not None else src
+        self._td_target = None
 
-        if dst == src or dst == src + 1:
-            return  # 沒有移動
+        # 整批連續、且插入點落在自己範圍內 → 沒有移動
+        contiguous = block == list(range(block[0], block[-1] + 1))
+        if contiguous and block[0] <= dst <= block[-1] + 1:
+            # 收回空位並還原來源縮圖顏色
+            self._reset_thumb_gap()
+            children = self.thumb_frame.winfo_children()
+            for i in block:
+                if i < len(children):
+                    children[i].winfo_children()[1].configure(bg="#333")
+            self._highlight_thumb(self.cur_page)
+            return
 
-        # 重新排列 pages
-        self._undo_stack.clear()   # 頁碼重編，舊復原紀錄會失準
-        page = self.pages.pop(src)
-        annot = self.annot_by_page.pop(src, [])
-
-        # dst 已經是「插入到 dst 之前」，但 pop 後索引需修正
-        if dst > src:
-            dst -= 1
-        self.pages.insert(dst, page)
-
-        # 重建標註映射（舊索引 → 新索引）
-        new_annot: dict[int, list] = {}
-        for old_i, v in self.annot_by_page.items():
-            if old_i == src:
-                continue
-            if src < old_i <= dst:
-                new_annot[old_i - 1] = v
-            elif dst <= old_i < src:
-                new_annot[old_i + 1] = v
-            else:
-                new_annot[old_i] = v
-        new_annot[dst] = annot
-        self.annot_by_page = new_annot
-
-        # 跟隨移動的頁面
-        self.cur_page = dst
+        n, first = self._move_pages(block, dst)
+        if n > 1:
+            self._undo_stack.append(("group", n))
+        self._sel = set(range(first, first + len(block)))
+        self._sel_anchor = first
+        self.cur_page = first
+        self._selected_annot = None
         self._rebuild_thumbs()
         self._render()
-        self._update_status(f"已將第 {src+1} 頁移至第 {dst+1} 頁")
+        if len(block) == 1:
+            self._update_status(f"已將第 {block[0]+1} 頁移至第 {first+1} 頁")
+        else:
+            self._update_status(f"已將 {len(block)} 頁移至第 {first+1} 頁起")
+
+    def _move_pages(self, block: list[int], insert_at: int):
+        """把 block（遞增）搬到插入點 insert_at（原索引的「插入到此之前」）。
+        以多次單頁搬移完成，每次都推一筆 reorder 紀錄；回傳 (筆數, 新的起始索引)。"""
+        bs = set(block)
+        moving = [self.pages[i] for i in block]
+        rest = [p for i, p in enumerate(self.pages) if i not in bs]
+        first = insert_at - sum(1 for i in block if i < insert_at)
+        final = rest[:first] + moving + rest[first:]
+        n = 0
+        # 依序把第 j 位該放的頁搬過來；只會往前搬，前面已排好的不受影響
+        for j, pg in enumerate(final):
+            cur = next(k for k in range(j, len(self.pages)) if self.pages[k] is pg)
+            if cur != j:
+                self._move_page_core(cur, j)
+                self._undo_stack.append(("reorder", j, cur))
+                n += 1
+        return n, first
+
+    @staticmethod
+    def _moved_index(i: int, src: int, dst: int) -> int:
+        """第 src 頁搬到 dst 之後，原本索引 i 的頁會在哪裡。"""
+        if i == src:
+            return dst
+        if src < i <= dst:
+            return i - 1
+        if dst <= i < src:
+            return i + 1
+        return i
+
+    def _undo_delpage_core(self, action) -> int:
+        _, nxt, pg, annot, saved = action
+        idx = len(self.pages) if nxt is None else next(
+            i for i, p in enumerate(self.pages) if p is nxt)
+        self.pages.insert(idx, pg)
+        self.annot_by_page = {(k if k < idx else k + 1): v
+                              for k, v in self.annot_by_page.items()}
+        if annot is not None:
+            self.annot_by_page[idx] = annot
+        self._remap_undo(lambda i: i if i < idx else i + 1)
+        for pos, a in saved:               # 放回刪除時收起的紀錄
+            self._undo_stack.insert(pos, a)
+        return idx
+
+    def _move_page_core(self, src: int, dst: int):
+        """把第 src 頁搬到最終索引 dst，並同步標註與復原紀錄的頁碼。"""
+        def remap(i: int) -> int:
+            return self._moved_index(i, src, dst)
+
+        self.pages.insert(dst, self.pages.pop(src))
+        self.annot_by_page = {remap(k): v for k, v in self.annot_by_page.items()}
+        self._remap_undo(remap)
+
+    @staticmethod
+    def _undo_refs_page(a, page: int) -> bool:
+        """這筆復原紀錄是否指向某頁（delpage、group 不含頁碼）。"""
+        if a[0] in ("delpage", "group"):
+            return False
+        if a[0] == "reorder":
+            return page in (a[1], a[2])
+        return a[1] == page
+
+    def _remap_undo(self, fn):
+        """頁碼重編時，同步更新復原紀錄裡的頁碼。"""
+        new_stack = []
+        for a in self._undo_stack:
+            if a[0] == "reorder":
+                new_stack.append(("reorder", fn(a[1]), fn(a[2])))
+            elif a[0] in ("delpage", "group"):
+                new_stack.append(a)
+            else:
+                new_stack.append((a[0], fn(a[1]), *a[2:]))
+        self._undo_stack = new_stack
 
     def _thumb_index_at_y(self, canvas_y: float) -> int:
-        """給定 canvas_y，回傳「插入點」索引（0..len(pages)）。"""
+        """給定 canvas_y，回傳「插入點」索引（0..len(pages)）。
+        使用拖曳開始時記下的原始位置，避免空位動畫造成判定抖動。"""
+        for i, mid in enumerate(self._td_mids):
+            if canvas_y < mid:
+                return i
+        return len(self._td_mids)
+
+    def _snapshot_thumb_mids(self):
+        frame_top = self.thumb_frame.winfo_y()
+        self._td_mids = [frame_top + c.winfo_y() + c.winfo_height() / 2
+                         for c in self.thumb_frame.winfo_children()]
+
+    # ── 拖曳空位動畫 ──────────────────────────────────────────────────────
+    _THUMB_PAD = 3
+
+    def _set_thumb_target(self, insert_at: int):
+        if insert_at == self._td_target:
+            return
+        self._td_target = insert_at
+        if self._td_anim is None:
+            self._animate_thumb_gap()
+
+    def _reset_thumb_gap(self):
+        self._td_target = None
+        if self._td_anim is None:
+            self._animate_thumb_gap()
+
+    def _animate_thumb_gap(self):
+        """每格縮圖的上/下 pady 往目標值逼近，形成空出位置的動畫。"""
+        self._td_anim = None
         children = self.thumb_frame.winfo_children()
         if not children:
-            return 0
-        # thumb_frame 相對 thumb_canvas 的偏移（因為 create_window anchor=nw）
-        frame_top = self.thumb_frame.winfo_y()
+            return
+        p = self._THUMB_PAD
+        tgt = self._td_target
+        gap = self._td_gap
+        done = True
         for i, child in enumerate(children):
-            cy_mid = frame_top + child.winfo_y() + child.winfo_height() // 2
-            if canvas_y < cy_mid:
-                return i
-        return len(children)
-
-    def _draw_drop_line(self, insert_at: int):
-        if self._td_drop_line:
-            self.thumb_canvas.delete(self._td_drop_line)
-        children = self.thumb_frame.winfo_children()
-        frame_top = self.thumb_frame.winfo_y()
-        w = self.thumb_canvas.winfo_width()
-
-        if insert_at == 0:
-            y = frame_top + (children[0].winfo_y() if children else 0)
-        elif insert_at >= len(children):
-            last = children[-1]
-            y = frame_top + last.winfo_y() + last.winfo_height()
-        else:
-            child = children[insert_at]
-            y = frame_top + child.winfo_y()
-
-        self._td_drop_line = self.thumb_canvas.create_line(
-            4, y, w - 4, y, fill="#4fc3f7", width=2)
+            want_top = p + gap if tgt == i else p
+            want_bot = p + gap if (tgt == len(children) and i == len(children) - 1) else p
+            cur_top, cur_bot = self._td_pads.get(i, (p, p))
+            new = []
+            for cur, want in ((cur_top, want_top), (cur_bot, want_bot)):
+                nxt = cur + (want - cur) * 0.35
+                if abs(want - nxt) < 0.5:
+                    nxt = want
+                else:
+                    done = False
+                new.append(nxt)
+            if (round(new[0]), round(new[1])) != (round(cur_top), round(cur_bot)):
+                child.pack_configure(pady=(round(new[0]), round(new[1])))
+            self._td_pads[i] = (new[0], new[1])
+        if not done:
+            self._td_anim = self.after(15, self._animate_thumb_gap)
 
     def _highlight_thumb(self, idx):
         children = self.thumb_frame.winfo_children()
+        sel = self._sel_pages() if len(getattr(self, "_sel", ())) > 1 else set()
         for i, child in enumerate(children):
             child.configure(bg="#555" if i == idx else "#333")
+            lbl, txt = child.winfo_children()[:2]
+            if i in sel:        # 多選：藍色外框 + 藍底頁碼
+                lbl.configure(bg="#4fc3f7", bd=2)
+                txt.configure(bg="#2f5f86", fg="#fff")
+            else:
+                lbl.configure(bg="#444", bd=2)
+                txt.configure(bg="#333", fg="#aaa")
         self._scroll_thumb_into_view(idx)
 
     def _scroll_thumb_into_view(self, idx):
@@ -1282,6 +1465,33 @@ class WinPreview(_Base):
             return
         action = self._undo_stack.pop()
         kind, page = action[0], action[1]
+        if kind in ("reorder", "delpage", "group"):
+            # 頁面層級：group 代表多選搬移/刪除，一次全部復原
+            n = action[1] if kind == "group" else 1
+            if kind != "group":
+                self._undo_stack.append(action)
+            pages: list[int] = []       # 復原後被還原的頁（用來選取）
+            for _ in range(min(n, len(self._undo_stack))):
+                a = self._undo_stack.pop()
+                if a[0] == "reorder":       # 搬回原位
+                    src, dst = a[1], a[2]
+                    pages = [self._moved_index(p, src, dst) for p in pages]
+                    self._move_page_core(src, dst)
+                    pages.append(dst)
+                elif a[0] == "delpage":     # 插回刪除的頁
+                    idx = self._undo_delpage_core(a)
+                    pages = [p + 1 if p >= idx else p for p in pages]
+                    pages.append(idx)
+            if pages:
+                self._sel = set(pages)
+                self.cur_page = min(pages)
+                self._sel_anchor = self.cur_page
+            self._selected_annot = None
+            self._rebuild_thumbs()
+            self._render()
+            self._update_status(f"已復原頁面{'刪除' if kind == 'delpage' else '移動' if kind == 'reorder' else '操作'}"
+                                f"（{len(pages)} 頁）")
+            return
         if kind == "add":                      # 復原新增 → 依物件移除
             obj = action[2]
             lst = self.annot_by_page.get(page)
@@ -1379,7 +1589,7 @@ class WinPreview(_Base):
     def _cmd_save(self):
         if not self.pages:
             messagebox.showinfo("提示", "目前沒有任何頁面")
-            return
+            return False
         path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF（保留所有頁面）", "*.pdf"),
@@ -1387,25 +1597,26 @@ class WinPreview(_Base):
                        ("JPEG（目前頁）", "*.jpg")],
             title="儲存")
         if not path:
-            return
+            return False
         p = Path(path)
         if p.suffix.lower() == ".pdf":
-            self._export_all_as_pdf(p)
-        else:
-            self._save_cur_page_as_image(p)
+            return self._export_all_as_pdf(p)
+        self._save_cur_page_as_image(p)
+        return False   # 只存目前頁的圖片，不算完整存檔
 
     def _cmd_save_as(self):
-        self._cmd_save()
+        return self._cmd_save()
 
     def _cmd_export_pdf(self):
         if not self.pages:
-            return
+            return False
         path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF", "*.pdf")],
             title="匯出所有頁面為 PDF")
-        if path:
-            self._export_all_as_pdf(Path(path))
+        if not path:
+            return False
+        return self._export_all_as_pdf(Path(path))
 
     def _cmd_export_image(self):
         if not self.pages:
@@ -1469,7 +1680,7 @@ class WinPreview(_Base):
             messagebox.showerror(
                 "缺少套件", "匯出 PDF 需要 pypdf 與 reportlab：\n"
                 "pip install pypdf reportlab")
-            return
+            return False
         try:
             writer = PdfWriter()
             reader_cache: dict[str, "PdfReader"] = {}
@@ -1498,8 +1709,11 @@ class WinPreview(_Base):
             with open(out_path, "wb") as f:
                 writer.write(f)
             self._update_status(f"已匯出 PDF：{out_path}（{len(self.pages)} 頁）")
+            self._mark_saved()
+            return True
         except Exception as e:
             messagebox.showerror("匯出失敗", str(e))
+            return False
 
     def _save_cur_page_as_image(self, path: Path):
         """匯出目前頁為圖片（含旋轉與標註，zoom=1.0 解析度）。"""
@@ -1532,6 +1746,46 @@ class WinPreview(_Base):
     def _hex_to_rgb(self, hex_color: str):
         h = hex_color.lstrip("#")
         return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+    # ── 未存檔追蹤 ────────────────────────────────────────────────────────────
+    def _doc_signature(self):
+        """頁面順序 + 每頁標註物件的快照。標註/頁面增刪、搬移都會產生新物件，
+        所以比對 id 即可；復原回到存檔時的狀態也會自動變回「未修改」。"""
+        return tuple((id(p), tuple(id(a) for a in self.annot_by_page.get(i, ())))
+                     for i, p in enumerate(self.pages))
+
+    def _is_dirty(self) -> bool:
+        return bool(self.pages) and self._doc_signature() != self._saved_sig
+
+    def _mark_saved(self):
+        self._saved_sig = self._doc_signature()
+        self._refresh_title()
+
+    def _refresh_title(self):
+        t = ("*" if self._is_dirty() else "") + self._title_base
+        if self.title() != t:
+            self.title(t)
+
+    def _poll_dirty(self):
+        self._refresh_title()
+        self.after(300, self._poll_dirty)
+
+    def _confirm_discard(self) -> bool:
+        """有未存檔的修改時詢問；回傳 True 表示可以繼續（已存檔或放棄修改）。"""
+        if not self._is_dirty():
+            return True
+        ans = messagebox.askyesnocancel(
+            "尚未儲存", "目前的修改尚未儲存，要先儲存嗎？\n\n"
+            "是：儲存為 PDF　否：放棄修改　取消：返回")
+        if ans is None:
+            return False
+        if ans:
+            return self._cmd_export_pdf()
+        return True
+
+    def _on_close(self):
+        if self._confirm_discard():
+            self.destroy()
 
     def _update_status(self, msg: str):
         self.status_var.set(msg)
