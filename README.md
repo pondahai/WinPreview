@@ -5,16 +5,16 @@ image viewer and PDF annotator in one lightweight window.
 
 Windows 版「預覽程式」：把圖片瀏覽與 PDF 標註整合在單一視窗，內建、免費、免安裝。
 
-![status](https://img.shields.io/badge/release-v0.3-blue)
+![status](https://img.shields.io/badge/release-v0.4-blue)
 
 ## ⬇️ 下載 Download
 
-最新版本：**[v0.3](https://github.com/pondahai/WinPreview/releases/latest)**（Windows 64-bit，免安裝）
+最新版本：**[v0.4](https://github.com/pondahai/WinPreview/releases/latest)**（Windows 64-bit，免安裝）
 
 | 下載 | 適合 |
 |------|------|
-| [**WinPreview.exe**](https://github.com/pondahai/WinPreview/releases/download/v0.3/WinPreview.exe)（單一檔） | 最簡潔；首次啟動需數秒解壓縮 |
-| [**WinPreview-v0.3-win64.zip**](https://github.com/pondahai/WinPreview/releases/download/v0.3/WinPreview-v0.3-win64.zip)（可攜資料夾） | **防毒誤報機率較低**；解壓後執行裡面的 `WinPreview.exe` |
+| [**WinPreview.exe**](https://github.com/pondahai/WinPreview/releases/download/v0.4/WinPreview.exe)（單一檔） | 最簡潔；首次啟動需數秒解壓縮 |
+| [**WinPreview-v0.4-win64.zip**](https://github.com/pondahai/WinPreview/releases/download/v0.4/WinPreview-v0.4-win64.zip)（可攜資料夾） | **防毒誤報機率較低**；解壓後執行裡面的 `WinPreview.exe` |
 
 > 兩者皆**完全免安裝**（自帶 Python 與所有相依）。單一檔 exe 可能被 Windows Defender
 > 以 `Wacatac.B!ml` 誤判，詳見下方「**防毒誤報**」一節。
@@ -25,7 +25,10 @@ Windows 版「預覽程式」：把圖片瀏覽與 PDF 標註整合在單一視�
 - **檢視模式**：**單頁顯示** 或 **連續捲動** 兩種切換。連續模式垂直堆疊所有頁面，採
   **延遲渲染**（只算視窗附近的頁，大型 PDF 也順暢），與側欄縮圖、頁碼**雙向連動**。
 - **拖放累加**：把多個檔案拖進視窗會「累加」成一份多頁文件（而非覆蓋）
-- **頁面側欄**：縮圖瀏覽、**拖曳調整順序**、`Del` 鍵刪除頁面
+- **頁面側欄**：縮圖瀏覽（支援滾輪）、**拖曳調整順序**（目標位置以動畫空出）、`Del` 鍵刪除頁面
+  - `Ctrl` / `Shift` + 點選可**多選**，多頁一起拖曳搬移或一起刪除
+  - 頁面搬移、刪除皆可 `Ctrl+Z` 復原（多頁操作一次復原）
+- **未存檔提醒**：有修改時標題列顯示 `*`，關閉 / 開新檔 / 清空前會詢問是否儲存
 - **標註工具**：畫筆、直線、矩形、橢圓、文字、螢光筆，多種顏色
   - 標註以「頁面原始座標」儲存，**縮放、旋轉、翻頁皆不跑位**
 - **標註編輯**（`▣` 選取工具）
@@ -137,6 +140,17 @@ reportlab 以 **alpha 透明**方式疊上，因此底層文字不會被覆蓋�
 - ✅ **功能不變且更佳**：匯出 PDF 仍保留可選取文字；標註疊層透明度正確。
 
 ## 📜 變更紀錄 Changelog
+
+### v0.4
+
+- **側欄多選**：`Ctrl+點選` 加入 / 移除單頁、`Shift+點選` 選取範圍；選取的頁可一起
+  拖曳搬移（保持原順序並排）或用 `Del` 一起刪除。
+- **頁面操作可復原**：頁面搬移、刪除皆可 `Ctrl+Z` 復原，多頁操作一次復原；
+  過去搬移 / 刪除頁面會清空復原紀錄，現在標註的復原紀錄會跟著頁面保留。
+- **拖曳排序更直覺**：拖曳縮圖時，目標位置會以動畫空出位置，取代不明顯的插入線。
+- **側欄支援滑鼠滾輪**：游標在縮圖上即可滾動（過去只能在捲軸上滾）。
+- **未存檔提醒**：有未儲存修改時標題列顯示 `*`；關閉視窗、開啟新檔、清空頁面前會詢問
+  「儲存 / 不儲存 / 取消」。
 
 ### v0.3
 
