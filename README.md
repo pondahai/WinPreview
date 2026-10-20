@@ -5,16 +5,16 @@ image viewer and PDF annotator in one lightweight window.
 
 Windows 版「預覽程式」：把圖片瀏覽與 PDF 標註整合在單一視窗，內建、免費、免安裝。
 
-![status](https://img.shields.io/badge/release-v0.4-blue)
+![status](https://img.shields.io/badge/release-v0.5-blue)
 
 ## ⬇️ 下載 Download
 
-最新版本：**[v0.4](https://github.com/pondahai/WinPreview/releases/latest)**（Windows 64-bit，免安裝）
+最新版本：**[v0.5](https://github.com/pondahai/WinPreview/releases/latest)**（Windows 64-bit，免安裝）
 
 | 下載 | 適合 |
 |------|------|
-| [**WinPreview.exe**](https://github.com/pondahai/WinPreview/releases/download/v0.4/WinPreview.exe)（單一檔） | 最簡潔；首次啟動需數秒解壓縮 |
-| [**WinPreview-v0.4-win64.zip**](https://github.com/pondahai/WinPreview/releases/download/v0.4/WinPreview-v0.4-win64.zip)（可攜資料夾） | **防毒誤報機率較低**；解壓後執行裡面的 `WinPreview.exe` |
+| [**WinPreview.exe**](https://github.com/pondahai/WinPreview/releases/download/v0.5/WinPreview.exe)（單一檔） | 最簡潔；首次啟動需數秒解壓縮 |
+| [**WinPreview-v0.5-win64.zip**](https://github.com/pondahai/WinPreview/releases/download/v0.5/WinPreview-v0.5-win64.zip)（可攜資料夾） | **防毒誤報機率較低**；解壓後執行裡面的 `WinPreview.exe` |
 
 > 兩者皆**完全免安裝**（自帶 Python 與所有相依）。單一檔 exe 可能被 Windows Defender
 > 以 `Wacatac.B!ml` 誤判，詳見下方「**防毒誤報**」一節。
@@ -156,7 +156,7 @@ reportlab 以 **alpha 透明**方式疊上，因此底層文字不會被覆蓋�
 
 ## 📜 變更紀錄 Changelog
 
-### 未發佈（main 分支）
+### v0.5
 
 - **頁面尺寸統一**：存成 PDF 時，圖片頁預設等比縮放置中到 **A4**（可改 Letter /
   與第一頁相同 / 保留原尺寸），依長寬自動直式或橫式。過去圖片以「1 像素 = 1 點」成頁，
