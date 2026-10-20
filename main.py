@@ -133,6 +133,7 @@ class WinPreview(_Base):
         self.out_page_size = tk.StringVar(value="a4")   # a4 | letter | first | original
         self.out_dpi       = tk.IntVar(value=150)       # 圖片頁解析度；0 = 原始
         self.out_fit_pdf   = tk.BooleanVar(value=False) # PDF 頁也縮放至目標尺寸
+        self.out_slim_pdf  = tk.BooleanVar(value=True)  # 壓縮 PDF 頁內的大圖
 
         self._build_ui()
         self._bind_events()
@@ -176,6 +177,8 @@ class WinPreview(_Base):
                                value=val)
         om.add_separator()
         om.add_checkbutton(label="PDF 頁也縮放至頁面尺寸", variable=self.out_fit_pdf)
+        om.add_checkbutton(label="壓縮 PDF 頁內的圖片（依上方解析度）",
+                           variable=self.out_slim_pdf)
         fm.add_separator()
         fm.add_command(label="清空全部頁面",               command=self._cmd_clear_all)
         fm.add_separator()
@@ -1746,6 +1749,36 @@ class WinPreview(_Base):
         buf.seek(0)
         return PdfReader(buf).pages[0]
 
+    def _slim_pdf_page(self, page, done: set):
+        """把 PDF 頁內過大或未壓縮的照片降採樣並改存 JPEG；文字與向量不動。"""
+        dpi = self.out_dpi.get()
+        box = page.mediabox
+        # 單張圖不會比整頁更大，故以頁面尺寸換算像素上限
+        max_w = float(box.width) / 72 * dpi
+        max_h = float(box.height) / 72 * dpi
+        for im in page.images:
+            ref = im.indirect_reference
+            if ref is None or ref.idnum in done:
+                continue
+            done.add(ref.idnum)
+            obj = ref.get_object()
+            if obj.get("/ImageMask") or "/SMask" in obj or "/Mask" in obj:
+                continue                          # 有遮罩/透明度，轉 JPEG 會失真
+            try:
+                pil = im.image
+            except Exception:
+                continue
+            if pil.mode not in ("RGB", "L"):
+                continue
+            s = min(1.0, max_w / pil.width, max_h / pil.height)
+            if s < 1.0:
+                pil = pil.resize((max(1, round(pil.width * s)),
+                                  max(1, round(pil.height * s))), Image.LANCZOS)
+            buf = io.BytesIO()
+            pil.save(buf, "JPEG", quality=JPEG_QUALITY, optimize=True)
+            if buf.tell() < len(obj._data) * 0.9:   # 明顯變小才替換
+                im.replace(pil, quality=JPEG_QUALITY)
+
     def _fit_pdf_page(self, page):
         """把 PDF 頁等比縮放置中至目標頁面尺寸（向量變換，文字仍可選取）。"""
         from pypdf import Transformation
@@ -1782,6 +1815,7 @@ class WinPreview(_Base):
         try:
             writer = PdfWriter()
             reader_cache: dict[str, "PdfReader"] = {}
+            slimmed: set = set()      # 已處理的圖片物件，多頁共用時只壓一次
             for i, entry in enumerate(self.pages):
                 overlay = self._render_annot_overlay(i)
                 if entry.kind == "pdf":
@@ -1800,6 +1834,8 @@ class WinPreview(_Base):
                         page.merge_page(ov)               # 標註疊在原頁上方
                     if self.out_fit_pdf.get():
                         self._fit_pdf_page(page)
+                    if self.out_slim_pdf.get() and self.out_dpi.get():
+                        self._slim_pdf_page(page, slimmed)
                 else:
                     writer.add_page(self._image_to_page(entry, overlay))
             with open(out_path, "wb") as f:
