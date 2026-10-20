@@ -145,6 +145,55 @@ def _print_pages(doc, pages, hdc, doc_name: str, output: str | None = None) -> i
         raise
     return printed
 
+def _default_printer_info() -> tuple[str, bool] | None:
+    """回傳 (預設印表機名稱, 是否黑白)；黑白 = 非彩色機，或其預設色彩設定為單色。
+    無預設印表機或查詢失敗時回傳 None。"""
+    import ctypes
+    from ctypes import wintypes as wt
+    winspool = ctypes.WinDLL("winspool.drv")
+    size = wt.DWORD(0)
+    winspool.GetDefaultPrinterW(None, ctypes.byref(size))
+    if not size.value:
+        return None
+    buf = ctypes.create_unicode_buffer(size.value)
+    if not winspool.GetDefaultPrinterW(buf, ctypes.byref(size)):
+        return None
+    return buf.value, _printer_is_mono(buf.value)
+
+def _printer_is_mono(name: str) -> bool:
+    """印表機是否黑白：非彩色機，或其預設色彩設定為單色。"""
+    import ctypes
+    from ctypes import wintypes as wt
+    winspool = ctypes.WinDLL("winspool.drv")
+    winspool.DeviceCapabilitiesW.argtypes = [wt.LPCWSTR, wt.LPCWSTR, wt.WORD,
+                                             ctypes.c_void_p, ctypes.c_void_p]
+    DC_COLORDEVICE = 32
+    if winspool.DeviceCapabilitiesW(name, None, DC_COLORDEVICE, None, None) != 1:
+        return True
+    # 彩色機：再看驅動程式的預設是否設成黑白（DEVMODEW.dmColor）
+    winspool.OpenPrinterW.argtypes = [wt.LPCWSTR, ctypes.POINTER(wt.HANDLE), ctypes.c_void_p]
+    winspool.ClosePrinter.argtypes = [wt.HANDLE]
+    winspool.DocumentPropertiesW.argtypes = [wt.HWND, wt.HANDLE, wt.LPCWSTR,
+                                             ctypes.c_void_p, ctypes.c_void_p, wt.DWORD]
+    winspool.DocumentPropertiesW.restype = wt.LONG
+    h = wt.HANDLE()
+    if not winspool.OpenPrinterW(name, ctypes.byref(h), None):
+        return False
+    try:
+        n = winspool.DocumentPropertiesW(None, h, name, None, None, 0)
+        if n <= 0:
+            return False
+        dm = ctypes.create_string_buffer(n)
+        DM_OUT_BUFFER = 2
+        if winspool.DocumentPropertiesW(None, h, name, dm, None, DM_OUT_BUFFER) < 0:
+            return False
+        fields = int.from_bytes(dm.raw[72:76], "little")         # dmFields
+        color = int.from_bytes(dm.raw[92:94], "little")          # dmColor
+        DM_COLOR, DMCOLOR_MONOCHROME = 0x800, 1
+        return bool(fields & DM_COLOR) and color == DMCOLOR_MONOCHROME
+    finally:
+        winspool.ClosePrinter(h)
+
 def _print_pdf(pdf_bytes: bytes, owner_hwnd: int, doc_name: str, cur_page: int = 0) -> int:
     """顯示 Windows 列印對話框（印表機、份數、頁碼範圍）後送印；取消回傳 0。"""
     import ctypes
@@ -1825,6 +1874,12 @@ class WinPreview(_Base):
         win.geometry("760x900")
         win.transient(self)
         state = {"idx": min(self.cur_page, len(doc) - 1), "photo": None}
+        # 預設依 Windows 預設印表機決定是否以黑白預覽（通用驅動可能誤報彩色，故可手動切換）
+        try:
+            printer = _default_printer_info() if sys.platform == "win32" else None
+        except Exception:
+            printer = None
+        mono = tk.BooleanVar(value=bool(printer and printer[1]))
 
         bar = tk.Frame(win, bg=TOOLBAR_BG)
         bar.pack(side=tk.TOP, fill=tk.X)
@@ -1838,7 +1893,7 @@ class WinPreview(_Base):
             w, h = page.get_size()
             cw, ch = max(cvs.winfo_width(), 100), max(cvs.winfo_height(), 100)
             s = min((cw - 40) / w, (ch - 40) / h)
-            img = page.render(scale=s).to_pil()
+            img = page.render(scale=s, grayscale=mono.get()).to_pil()
             state["photo"] = ImageTk.PhotoImage(img)
             cvs.delete("all")
             x, y = (cw - img.width) // 2, (ch - img.height) // 2
@@ -1859,9 +1914,14 @@ class WinPreview(_Base):
         tk.Button(bar, text="◀", command=lambda: go(-1)).pack(side=tk.LEFT, padx=(12, 0))
         tk.Button(bar, text="▶", command=lambda: go(1)).pack(side=tk.LEFT)
         label.pack(side=tk.LEFT, padx=8)
-        tk.Label(bar, text="版面依「PDF 輸出設定」；列印時會縮放至紙張可列印範圍",
-                 bg=TOOLBAR_BG, fg="#666666").pack(side=tk.RIGHT, padx=8)
+        tk.Checkbutton(bar, text="黑白", variable=mono, command=show,
+                       bg=TOOLBAR_BG).pack(side=tk.LEFT, padx=4)
         tk.Button(bar, text="關閉", command=win.destroy).pack(side=tk.RIGHT, padx=4)
+        hint = "版面依「PDF 輸出設定」；列印時會縮放至紙張可列印範圍"
+        if printer:
+            hint = (f"預設印表機：{printer[0]}（{'黑白' if printer[1] else '彩色'}）　" + hint)
+        tk.Label(win, text=hint, bg=TOOLBAR_BG, fg="#666666",
+                 anchor=tk.W).pack(side=tk.BOTTOM, fill=tk.X, before=cvs)
 
         cvs.bind("<Configure>", lambda e: show())
         for key, d in (("<Prior>", -1), ("<Left>", -1), ("<Next>", 1), ("<Right>", 1)):
