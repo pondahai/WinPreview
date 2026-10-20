@@ -49,6 +49,11 @@ SIDEBAR_W    = 130
 ANNOT_COLORS = ["#e74c3c", "#e67e22", "#f1c40f", "#2ecc71",
                 "#3498db", "#9b59b6", "#1abc9c", "#000000"]
 
+# PDF 輸出：頁面尺寸（點，直式）與圖片頁邊距
+PAGE_SIZES   = {"a4": (595.28, 841.89), "letter": (612.0, 792.0)}
+PAGE_MARGIN  = 18          # 圖片頁四周留白（點，約 6 mm）
+JPEG_QUALITY = 85
+
 # ── 頁面描述子 ────────────────────────────────────────────────────────────────
 # 每個元素是 {"type": "pdf"|"img", "doc": pdfium.PdfDocument, "page": int}
 #                                    或 {"type": "img", "pil": PIL.Image}
@@ -124,6 +129,11 @@ class WinPreview(_Base):
 
         self._thumb_imgs: list[ImageTk.PhotoImage] = []
 
+        # ── PDF 輸出設定 ──
+        self.out_page_size = tk.StringVar(value="a4")   # a4 | letter | first | original
+        self.out_dpi       = tk.IntVar(value=150)       # 圖片頁解析度；0 = 原始
+        self.out_fit_pdf   = tk.BooleanVar(value=False) # PDF 頁也縮放至目標尺寸
+
         self._build_ui()
         self._bind_events()
         self._update_status("就緒 — 開啟或拖入檔案（Ctrl+O）")
@@ -152,6 +162,20 @@ class WinPreview(_Base):
         fm.add_separator()
         fm.add_command(label="匯出為 PDF…",               command=self._cmd_export_pdf)
         fm.add_command(label="匯出目前頁為圖片…",          command=self._cmd_export_image)
+        om = tk.Menu(fm, tearoff=False)
+        fm.add_cascade(label="PDF 輸出設定", menu=om)
+        for label, val in [("A4", "a4"), ("Letter", "letter"),
+                           ("與第一頁相同", "first"), ("保留原尺寸", "original")]:
+            om.add_radiobutton(label=f"頁面：{label}", variable=self.out_page_size,
+                               value=val)
+        om.add_separator()
+        for label, val in [("96 dpi（最小）", 96), ("150 dpi（建議）", 150),
+                           ("200 dpi", 200), ("300 dpi（列印品質）", 300),
+                           ("原始解析度", 0)]:
+            om.add_radiobutton(label=f"圖片：{label}", variable=self.out_dpi,
+                               value=val)
+        om.add_separator()
+        om.add_checkbutton(label="PDF 頁也縮放至頁面尺寸", variable=self.out_fit_pdf)
         fm.add_separator()
         fm.add_command(label="清空全部頁面",               command=self._cmd_clear_all)
         fm.add_separator()
@@ -1656,21 +1680,95 @@ class WinPreview(_Base):
         buf.seek(0)
         return PdfReader(buf).pages[0]
 
-    @staticmethod
-    def _image_to_page(img: Image.Image, overlay, w: float, h: float):
-        """把整頁圖片（+選用標註層）轉成 w×h 點的單頁 PDF。"""
+    def _target_page_size(self, w: float, h: float):
+        """依輸出設定回傳 (W, H) 點，方向配合 w×h；「保留原尺寸」回傳 None。"""
+        mode = self.out_page_size.get()
+        if mode == "original":
+            return None
+        size = PAGE_SIZES.get(mode)
+        if mode == "first":
+            first = self.pages[0] if self.pages else None
+            if first is not None and first.kind == "pdf":
+                size = first.doc[first.page_idx].get_size()
+            else:
+                size = PAGE_SIZES["a4"]      # 第一頁是圖片時無從參考，改用 A4
+        W, H = sorted(size)
+        return (H, W) if w > h else (W, H)
+
+    def _image_reader(self, img: Image.Image, source_path, resized: bool):
+        """挑選最省空間的嵌入方式：原 JPEG 直接沿用，其餘照片轉 JPEG，透明圖用 PNG。"""
+        from reportlab.lib.utils import ImageReader
+        if img.mode == "RGBA" and img.getextrema()[3][0] < 255:
+            return ImageReader(img)                       # 有透明度 → 無損
+        if (not resized and source_path is not None
+                and Path(source_path).suffix.lower() in (".jpg", ".jpeg")):
+            return ImageReader(str(source_path))          # 原檔 JPEG，不重新編碼
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, "JPEG", quality=JPEG_QUALITY, optimize=True)
+        buf.seek(0)
+        return ImageReader(buf)
+
+    def _image_to_page(self, entry: PageEntry, overlay):
+        """把圖片頁（+選用標註層）轉成單頁 PDF：等比縮放置中於目標頁面，並依 dpi 降採樣。"""
         from pypdf import PdfReader
         from reportlab.pdfgen import canvas as rl_canvas
         from reportlab.lib.utils import ImageReader
+        img = entry.pil
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        iw, ih = img.size
+        target = self._target_page_size(iw, ih)
+        if target is None:                    # 舊行為：1px = 1pt，頁面即圖片
+            W, H = float(iw), float(ih)
+            dx, dy, dw, dh = 0.0, 0.0, W, H
+        else:
+            W, H = target
+            s = min((W - 2 * PAGE_MARGIN) / iw, (H - 2 * PAGE_MARGIN) / ih)
+            dw, dh = iw * s, ih * s
+            dx, dy = (W - dw) / 2, (H - dh) / 2
+        resized = False
+        dpi = self.out_dpi.get()
+        if dpi and target is not None:
+            pw, ph = round(dw / 72 * dpi), round(dh / 72 * dpi)
+            if pw < iw:
+                img = img.resize((pw, ph), Image.LANCZOS)
+                if overlay is not None:
+                    overlay = overlay.resize((pw, ph), Image.LANCZOS)
+                resized = True
         buf = io.BytesIO()
-        c = rl_canvas.Canvas(buf, pagesize=(w, h))
-        c.drawImage(ImageReader(img), 0, 0, width=w, height=h)
+        c = rl_canvas.Canvas(buf, pagesize=(W, H))
+        c.drawImage(self._image_reader(img, entry.source_path, resized),
+                    dx, dy, width=dw, height=dh, mask="auto")
         if overlay is not None:
-            c.drawImage(ImageReader(overlay), 0, 0, width=w, height=h, mask="auto")
+            c.drawImage(ImageReader(overlay), dx, dy, width=dw, height=dh, mask="auto")
         c.showPage()
         c.save()
         buf.seek(0)
         return PdfReader(buf).pages[0]
+
+    def _fit_pdf_page(self, page):
+        """把 PDF 頁等比縮放置中至目標頁面尺寸（向量變換，文字仍可選取）。"""
+        from pypdf import Transformation
+        from pypdf.generic import RectangleObject
+        box = page.mediabox
+        x0, y0 = float(box.left), float(box.bottom)
+        bw, bh = float(box.width), float(box.height)
+        target = self._target_page_size(bw, bh)
+        if target is None:
+            return
+        W, H = target
+        if abs(W - bw) < 1 and abs(H - bh) < 1:
+            return
+        s = min(W / bw, H / bh)
+        ox, oy = (W - bw * s) / 2, (H - bh * s) / 2
+        page.add_transformation(
+            Transformation().translate(-x0, -y0).scale(s, s).translate(ox, oy))
+        rect = RectangleObject([0, 0, W, H])
+        page.mediabox = rect
+        page.cropbox = rect
+        page.trimbox = rect
+        page.bleedbox = rect
+        page.artbox = rect
 
     def _export_all_as_pdf(self, out_path: Path):
         """匯出所有頁面；PDF 頁直接複製原頁（保留可選取文字），標註以透明圖層疊加。"""
@@ -1692,20 +1790,18 @@ class WinPreview(_Base):
                     if reader is None:
                         reader = PdfReader(src)
                         reader_cache[src] = reader
-                    page = reader.pages[entry.page_idx]   # 原頁，文字/向量原封不動
+                    # 原頁，文字/向量原封不動；在 writer 內的副本上修改，
+                    # 同一來源頁加入多次時才不會重複疊加
+                    page = writer.add_page(reader.pages[entry.page_idx])
                     if overlay is not None:
                         box = page.mediabox
                         ov = self._overlay_to_page(
                             overlay, float(box.width), float(box.height))
                         page.merge_page(ov)               # 標註疊在原頁上方
-                    writer.add_page(page)
+                    if self.out_fit_pdf.get():
+                        self._fit_pdf_page(page)
                 else:
-                    img = entry.pil
-                    if img.mode not in ("RGB", "RGBA"):
-                        img = img.convert("RGB")
-                    # 沿用舊行為：圖片像素數 = PDF 點數（1px = 1pt）
-                    page = self._image_to_page(img, overlay, img.width, img.height)
-                    writer.add_page(page)
+                    writer.add_page(self._image_to_page(entry, overlay))
             with open(out_path, "wb") as f:
                 writer.write(f)
             self._update_status(f"已匯出 PDF：{out_path}（{len(self.pages)} 頁）")
