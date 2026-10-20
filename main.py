@@ -69,6 +69,130 @@ class PageEntry:
         self.source_path = source_path  # 原始檔案路徑
 
 
+# ── 列印（Windows GDI，經 ctypes，不需額外套件）────────────────────────────────
+PRINT_MAX_DPI = 300        # 渲染上限；更高的印表機解析度交給 GDI 平滑放大
+
+def _gdi():
+    """載入 GDI 函式並宣告 argtypes（64 位元下 handle 不可被截成 int）。"""
+    import ctypes
+    from ctypes import wintypes as wt
+    vp, ci = ctypes.c_void_p, ctypes.c_int
+    gdi32, kernel32 = ctypes.windll.gdi32, ctypes.windll.kernel32
+    kernel32.GlobalFree.argtypes = [vp]
+    gdi32.CreateDCW.argtypes = [wt.LPCWSTR, wt.LPCWSTR, vp, vp]
+    gdi32.CreateDCW.restype = vp
+    gdi32.DeleteDC.argtypes = [vp]
+    gdi32.GetDeviceCaps.argtypes = [vp, ci]
+    gdi32.StartDocW.argtypes = [vp, vp]
+    gdi32.StartPage.argtypes = gdi32.EndPage.argtypes = [vp]
+    gdi32.EndDoc.argtypes = gdi32.AbortDoc.argtypes = [vp]
+    gdi32.SetStretchBltMode.argtypes = [vp, ci]
+    gdi32.SetBrushOrgEx.argtypes = [vp, ci, ci, vp]
+    gdi32.StretchDIBits.argtypes = [vp] + [ci] * 8 + [ctypes.c_char_p, vp,
+                                                      ctypes.c_uint, wt.DWORD]
+    return gdi32, kernel32
+
+def _print_pages(doc, pages, hdc, doc_name: str, output: str | None = None) -> int:
+    """把 pdfium 文件的指定頁，等比置中印在 hdc 的可列印範圍內；回傳已印頁數。
+    output 指定時改印到該檔案（供「Microsoft Print to PDF」測試用）。"""
+    import ctypes
+    from ctypes import wintypes as wt
+    gdi32, _ = _gdi()
+
+    class DOCINFOW(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_int), ("lpszDocName", wt.LPCWSTR),
+                    ("lpszOutput", wt.LPCWSTR), ("lpszDatatype", wt.LPCWSTR),
+                    ("fwType", wt.DWORD)]
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
+                    ("biPlanes", wt.WORD), ("biBitCount", wt.WORD),
+                    ("biCompression", wt.DWORD), ("biSizeImage", wt.DWORD),
+                    ("biXPelsPerMeter", wt.LONG), ("biYPelsPerMeter", wt.LONG),
+                    ("biClrUsed", wt.DWORD), ("biClrImportant", wt.DWORD)]
+
+    pw, ph = gdi32.GetDeviceCaps(hdc, 8), gdi32.GetDeviceCaps(hdc, 10)  # 可列印範圍（HORZRES/VERTRES）
+    di = DOCINFOW(ctypes.sizeof(DOCINFOW), doc_name, output, None, 0)
+    if gdi32.StartDocW(hdc, ctypes.byref(di)) <= 0:
+        raise OSError("無法開始列印工作")
+    gdi32.SetStretchBltMode(hdc, 4)               # HALFTONE：縮放品質較好
+    gdi32.SetBrushOrgEx(hdc, 0, 0, None)
+    printed = 0
+    try:
+        for i in pages:
+            page = doc[i]
+            w, h = page.get_size()
+            # 頁面方向與紙張不同時轉 90°，讓內容盡量放大
+            rot = 90 if (w > h) != (pw > ph) else 0
+            if rot:
+                w, h = h, w
+            s = min(pw / w, ph / h)               # 點 → 印表機像素
+            dw, dh = int(w * s), int(h * s)
+            rs = min(s, PRINT_MAX_DPI / 72)       # 渲染倍率（像素/點）
+            img = page.render(scale=rs, rotation=rot).to_pil().convert("RGB")
+            bits = img.tobytes("raw", "BGRX")
+            bih = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), img.width,
+                                   -img.height, 1, 32, 0, 0, 0, 0, 0, 0)
+            gdi32.StartPage(hdc)
+            gdi32.StretchDIBits(hdc, (pw - dw) // 2, (ph - dh) // 2,
+                                dw, dh, 0, 0, img.width, img.height, bits,
+                                ctypes.byref(bih), 0, 0x00CC0020)   # DIB_RGB_COLORS, SRCCOPY
+            gdi32.EndPage(hdc)
+            printed += 1
+        gdi32.EndDoc(hdc)
+    except Exception:
+        gdi32.AbortDoc(hdc)
+        raise
+    return printed
+
+def _print_pdf(pdf_bytes: bytes, owner_hwnd: int, doc_name: str, cur_page: int = 0) -> int:
+    """顯示 Windows 列印對話框（印表機、份數、頁碼範圍）後送印；取消回傳 0。"""
+    import ctypes
+    from ctypes import wintypes as wt
+    gdi32, kernel32 = _gdi()
+
+    class PRINTDLGW(ctypes.Structure):
+        _fields_ = [("lStructSize", wt.DWORD), ("hwndOwner", wt.HWND),
+                    ("hDevMode", ctypes.c_void_p), ("hDevNames", ctypes.c_void_p),
+                    ("hDC", ctypes.c_void_p), ("Flags", wt.DWORD),
+                    ("nFromPage", wt.WORD), ("nToPage", wt.WORD),
+                    ("nMinPage", wt.WORD), ("nMaxPage", wt.WORD),
+                    ("nCopies", wt.WORD), ("hInstance", wt.HINSTANCE),
+                    ("lCustData", wt.LPARAM), ("lpfnPrintHook", ctypes.c_void_p),
+                    ("lpfnSetupHook", ctypes.c_void_p),
+                    ("lpPrintTemplateName", wt.LPCWSTR),
+                    ("lpSetupTemplateName", wt.LPCWSTR),
+                    ("hPrintTemplate", ctypes.c_void_p),
+                    ("hSetupTemplate", ctypes.c_void_p)]
+
+    PD_PAGENUMS, PD_NOSELECTION, PD_RETURNDC = 0x2, 0x4, 0x100
+    PD_USEDEVMODECOPIESANDCOLLATE = 0x40000       # 份數/自動分頁交給驅動程式
+    doc = pdfium.PdfDocument(pdf_bytes)
+    n = len(doc)
+    pd = PRINTDLGW()
+    pd.lStructSize = ctypes.sizeof(PRINTDLGW)
+    pd.hwndOwner = owner_hwnd
+    pd.Flags = PD_RETURNDC | PD_NOSELECTION | PD_USEDEVMODECOPIESANDCOLLATE
+    pd.nMinPage, pd.nMaxPage = 1, n
+    pd.nFromPage = pd.nToPage = cur_page + 1
+    pd.nCopies = 1
+    try:
+        if not ctypes.windll.comdlg32.PrintDlgW(ctypes.byref(pd)):
+            return 0
+        if pd.Flags & PD_PAGENUMS:
+            pages = range(max(1, pd.nFromPage) - 1, min(n, pd.nToPage))
+        else:
+            pages = range(n)
+        return _print_pages(doc, pages, pd.hDC, doc_name)
+    finally:
+        if pd.hDC:
+            gdi32.DeleteDC(pd.hDC)
+        for h in (pd.hDevMode, pd.hDevNames):
+            if h:
+                kernel32.GlobalFree(h)
+        doc.close()
+
+
 # ── 主應用程式 ────────────────────────────────────────────────────────────────
 _Base = TkinterDnD.Tk if _HAS_DND else tk.Tk
 
@@ -163,6 +287,9 @@ class WinPreview(_Base):
         fm.add_separator()
         fm.add_command(label="匯出為 PDF…",               command=self._cmd_export_pdf)
         fm.add_command(label="匯出目前頁為圖片…",          command=self._cmd_export_image)
+        fm.add_separator()
+        fm.add_command(label="列印預覽…",                 command=self._cmd_print_preview)
+        fm.add_command(label="列印…\tCtrl+P",             command=self._cmd_print)
         om = tk.Menu(fm, tearoff=False)
         fm.add_cascade(label="PDF 輸出設定", menu=om)
         for label, val in [("A4", "a4"), ("Letter", "letter"),
@@ -341,6 +468,7 @@ class WinPreview(_Base):
         self.bind("<Control-o>",     lambda e: self._cmd_open())
         self.bind("<Control-s>",     lambda e: self._cmd_save())
         self.bind("<Control-S>",     lambda e: self._cmd_save_as())
+        self.bind("<Control-p>",     lambda e: self._cmd_print())
         self.bind("<Control-plus>",  lambda e: self._zoom_in())
         self.bind("<Control-equal>", lambda e: self._zoom_in())
         self.bind("<Control-minus>", lambda e: self._zoom_out())
@@ -1657,6 +1785,93 @@ class WinPreview(_Base):
         if path:
             self._save_cur_page_as_image(Path(path))
 
+    # ── 列印 ─────────────────────────────────────────────────────────────────
+    def _print_data(self) -> bytes | None:
+        """依 PDF 輸出設定組出要列印的內容（不做有損壓縮，印出來與存檔版面一致）。"""
+        if not self.pages:
+            messagebox.showinfo("提示", "目前沒有任何頁面")
+            return None
+        self._update_status("準備列印內容…")
+        self.update_idletasks()
+        try:
+            return self._build_pdf(slim=False)
+        except Exception as e:
+            messagebox.showerror("列印失敗", str(e))
+            return None
+
+    def _cmd_print(self, data: bytes | None = None, parent=None, cur_page=None):
+        if sys.platform != "win32":
+            messagebox.showerror("列印", "列印功能僅支援 Windows")
+            return
+        data = data or self._print_data()
+        if data is None:
+            return
+        owner = parent or self
+        try:
+            n = _print_pdf(data, int(owner.wm_frame(), 16), self._title_base,
+                           self.cur_page if cur_page is None else cur_page)
+        except Exception as e:
+            messagebox.showerror("列印失敗", str(e), parent=owner)
+            return
+        self._update_status(f"已送出列印：{n} 頁" if n else "已取消列印")
+
+    def _cmd_print_preview(self):
+        data = self._print_data()
+        if data is None:
+            return
+        doc = pdfium.PdfDocument(data)
+        win = tk.Toplevel(self)
+        win.title("列印預覽")
+        win.geometry("760x900")
+        win.transient(self)
+        state = {"idx": min(self.cur_page, len(doc) - 1), "photo": None}
+
+        bar = tk.Frame(win, bg=TOOLBAR_BG)
+        bar.pack(side=tk.TOP, fill=tk.X)
+        cvs = tk.Canvas(win, bg="#606060", highlightthickness=0)
+        cvs.pack(fill=tk.BOTH, expand=True)
+        label = tk.Label(bar, bg=TOOLBAR_BG)
+
+        def show():
+            i = state["idx"]
+            page = doc[i]
+            w, h = page.get_size()
+            cw, ch = max(cvs.winfo_width(), 100), max(cvs.winfo_height(), 100)
+            s = min((cw - 40) / w, (ch - 40) / h)
+            img = page.render(scale=s).to_pil()
+            state["photo"] = ImageTk.PhotoImage(img)
+            cvs.delete("all")
+            x, y = (cw - img.width) // 2, (ch - img.height) // 2
+            cvs.create_rectangle(x + 4, y + 4, x + img.width + 4, y + img.height + 4,
+                                 fill="#333333", outline="")       # 陰影
+            cvs.create_image(x, y, image=state["photo"], anchor=tk.NW)
+            mm = lambda pt: round(pt / 72 * 25.4)
+            label.config(text=f"第 {i + 1} / {len(doc)} 頁　{mm(w)}×{mm(h)} mm")
+
+        def go(d):
+            state["idx"] = max(0, min(len(doc) - 1, state["idx"] + d))
+            show()
+
+        def do_print():
+            self._cmd_print(data, parent=win, cur_page=state["idx"])
+
+        tk.Button(bar, text="列印…", command=do_print).pack(side=tk.LEFT, padx=4, pady=4)
+        tk.Button(bar, text="◀", command=lambda: go(-1)).pack(side=tk.LEFT, padx=(12, 0))
+        tk.Button(bar, text="▶", command=lambda: go(1)).pack(side=tk.LEFT)
+        label.pack(side=tk.LEFT, padx=8)
+        tk.Label(bar, text="版面依「PDF 輸出設定」；列印時會縮放至紙張可列印範圍",
+                 bg=TOOLBAR_BG, fg="#666666").pack(side=tk.RIGHT, padx=8)
+        tk.Button(bar, text="關閉", command=win.destroy).pack(side=tk.RIGHT, padx=4)
+
+        cvs.bind("<Configure>", lambda e: show())
+        for key, d in (("<Prior>", -1), ("<Left>", -1), ("<Next>", 1), ("<Right>", 1)):
+            win.bind(key, lambda e, d=d: go(d))
+        win.bind("<Control-p>", lambda e: do_print())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Destroy>", lambda e: e.widget is win and doc.close())
+        self._update_status(f"列印預覽：共 {len(doc)} 頁")
+        win.focus_set()
+
     def _render_annot_overlay(self, page_idx: int) -> Image.Image | None:
         """產生一張基底大小、未旋轉的透明 PNG，只含該頁標註。"""
         annots = self.annot_by_page.get(page_idx, [])
@@ -1815,43 +2030,51 @@ class WinPreview(_Base):
         page.bleedbox = rect
         page.artbox = rect
 
+    def _build_pdf(self, slim: bool = True) -> bytes:
+        """依輸出設定組出整份 PDF；PDF 頁直接複製原頁（保留可選取文字），標註以透明圖層疊加。"""
+        from pypdf import PdfReader, PdfWriter
+        writer = PdfWriter()
+        reader_cache: dict[str, "PdfReader"] = {}
+        slimmed: set = set()      # 已處理的圖片物件，多頁共用時只壓一次
+        for i, entry in enumerate(self.pages):
+            overlay = self._render_annot_overlay(i)
+            if entry.kind == "pdf":
+                src = str(entry.source_path)
+                reader = reader_cache.get(src)
+                if reader is None:
+                    reader = PdfReader(src)
+                    reader_cache[src] = reader
+                # 原頁，文字/向量原封不動；在 writer 內的副本上修改，
+                # 同一來源頁加入多次時才不會重複疊加
+                page = writer.add_page(reader.pages[entry.page_idx])
+                if overlay is not None:
+                    box = page.mediabox
+                    ov = self._overlay_to_page(
+                        overlay, float(box.width), float(box.height))
+                    page.merge_page(ov)               # 標註疊在原頁上方
+                if self.out_fit_pdf.get():
+                    self._fit_pdf_page(page)
+                if slim and self.out_slim_pdf.get() and self.out_dpi.get():
+                    self._slim_pdf_page(page, slimmed)
+            else:
+                writer.add_page(self._image_to_page(entry, overlay))
+        buf = io.BytesIO()
+        writer.write(buf)
+        return buf.getvalue()
+
     def _export_all_as_pdf(self, out_path: Path):
-        """匯出所有頁面；PDF 頁直接複製原頁（保留可選取文字），標註以透明圖層疊加。"""
+        """匯出所有頁面為 PDF 檔。"""
         try:
-            from pypdf import PdfReader, PdfWriter
+            import pypdf, reportlab  # noqa: F401
         except ImportError:
             messagebox.showerror(
                 "缺少套件", "匯出 PDF 需要 pypdf 與 reportlab：\n"
                 "pip install pypdf reportlab")
             return False
         try:
-            writer = PdfWriter()
-            reader_cache: dict[str, "PdfReader"] = {}
-            slimmed: set = set()      # 已處理的圖片物件，多頁共用時只壓一次
-            for i, entry in enumerate(self.pages):
-                overlay = self._render_annot_overlay(i)
-                if entry.kind == "pdf":
-                    src = str(entry.source_path)
-                    reader = reader_cache.get(src)
-                    if reader is None:
-                        reader = PdfReader(src)
-                        reader_cache[src] = reader
-                    # 原頁，文字/向量原封不動；在 writer 內的副本上修改，
-                    # 同一來源頁加入多次時才不會重複疊加
-                    page = writer.add_page(reader.pages[entry.page_idx])
-                    if overlay is not None:
-                        box = page.mediabox
-                        ov = self._overlay_to_page(
-                            overlay, float(box.width), float(box.height))
-                        page.merge_page(ov)               # 標註疊在原頁上方
-                    if self.out_fit_pdf.get():
-                        self._fit_pdf_page(page)
-                    if self.out_slim_pdf.get() and self.out_dpi.get():
-                        self._slim_pdf_page(page, slimmed)
-                else:
-                    writer.add_page(self._image_to_page(entry, overlay))
+            data = self._build_pdf()
             with open(out_path, "wb") as f:
-                writer.write(f)
+                f.write(data)
             self._update_status(f"已匯出 PDF：{out_path}（{len(self.pages)} 頁）")
             self._mark_saved()
             return True
