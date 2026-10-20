@@ -37,9 +37,23 @@ Windows 版「預覽程式」：把圖片瀏覽與 PDF 標註整合在單一視�
   - **搬移**：按住選中的標註拖曳即可移動位置
   - **復原**：`Ctrl+Z` 可逐步回退新增 / 刪除 / 搬移 / 整頁清除
 - **縮放 / 旋轉**：符合視窗、實際大小、`Ctrl+滾輪` 縮放、左右旋轉
+- **手機照片自動轉正**：依 EXIF 方向資訊顯示，存成 PDF 也不會變橫的
 - **匯出**
   - 匯出為 **PDF**：合併所有頁面；PDF 原頁保留**可選取文字**，標註以圖層疊加
   - 匯出目前頁為 **圖片**（PNG / JPEG / BMP）
+- **PDF 輸出設定**（檔案 → PDF 輸出設定）
+  - **頁面尺寸**：A4（預設）/ Letter / 與第一頁相同 / 保留原尺寸。圖片頁等比縮放、
+    置中並留邊，依長寬自動選直式或橫式
+  - **PDF 頁也縮放至頁面尺寸**（選用）：向量縮放，文字仍可選取
+  - **自動瘦身**：圖片依所選解析度（96 / 150 / 200 / 300 dpi / 原始）降採樣並改存 JPEG；
+    原檔已是夠小的 JPEG 則直接沿用、不重新壓縮；有透明度的圖保留透明
+  - **壓縮 PDF 頁內的圖片**（預設開啟）：既有 PDF 裡過大或未壓縮的照片一併瘦身，
+    文字與向量不動。例如一份 37 MB 的照片報告，以 A4 + 150 dpi 輸出後約 2 MB
+- **列印 / 列印預覽**
+  - 列印預覽依「PDF 輸出設定」顯示實際版面與紙張尺寸（mm），可切換**黑白**預覽；
+    若 Windows 預設印表機為黑白機或預設黑白，會自動以黑白顯示
+  - 列印使用 Windows 標準列印對話框（印表機、份數、頁碼範圍），每頁等比置中於可列印範圍，
+    方向與紙張不同時自動轉 90°；不需額外套件
 
 ## 🚀 安裝與執行 Run from source
 
@@ -95,6 +109,7 @@ build.bat
 |------|------|
 | `Ctrl+O` | 開啟（可多選） |
 | `Ctrl+S` | 儲存 / 匯出 |
+| `Ctrl+P` | 列印（列印預覽視窗中亦可） |
 | `Ctrl++` / `Ctrl+-` | 放大 / 縮小 |
 | `Ctrl+0` / `Ctrl+1` | 符合視窗 / 實際大小 |
 | `Ctrl+L` / `Ctrl+R` | 左轉 / 右轉 90° |
@@ -105,7 +120,7 @@ build.bat
 
 ## 🛠 技術 Built with
 
-Python · tkinter · [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)（PDF 渲染）· [pypdf](https://pypdf.readthedocs.io/)＋[reportlab](https://www.reportlab.com/)（PDF 匯出）· [Pillow](https://python-pillow.org/) · tkinterdnd2
+Python · tkinter · [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)（PDF 渲染）· [pypdf](https://pypdf.readthedocs.io/)＋[reportlab](https://www.reportlab.com/)（PDF 匯出）· [Pillow](https://python-pillow.org/) · tkinterdnd2 · Windows GDI（經 `ctypes` 列印）
 
 ## 🔧 PDF 引擎替換 PDF engine migration
 
@@ -140,6 +155,19 @@ reportlab 以 **alpha 透明**方式疊上，因此底層文字不會被覆蓋�
 - ✅ **功能不變且更佳**：匯出 PDF 仍保留可選取文字；標註疊層透明度正確。
 
 ## 📜 變更紀錄 Changelog
+
+### 未發佈（main 分支）
+
+- **頁面尺寸統一**：存成 PDF 時，圖片頁預設等比縮放置中到 **A4**（可改 Letter /
+  與第一頁相同 / 保留原尺寸），依長寬自動直式或橫式。過去圖片以「1 像素 = 1 點」成頁，
+  一張手機照片會變成約 142×107 cm 的巨大頁面。可選擇讓 PDF 頁也縮放至同一尺寸。
+- **檔案瘦身**：圖片依所選 dpi（預設 150）降採樣並改存 JPEG。過去照片以無損壓縮寫入，
+  存檔後往往比原圖大好幾倍。既有 PDF 頁內的大圖也可一併壓縮（預設開啟）。
+- **修正透明圖片**：半透明 PNG 存成 PDF 時不再失去透明度。
+- **手機照片方向**：開啟時依 EXIF 轉正，預覽、標註、匯出方向一致。
+- **新增列印與列印預覽**（`Ctrl+P`），預覽可切換黑白並依預設印表機自動判斷。
+  > 部分印表機使用 Windows 通用驅動（如 *Microsoft IPP Class Driver*）時會誤報為彩色，
+  > 此時請手動勾選「黑白」。
 
 ### v0.4
 
