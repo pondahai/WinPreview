@@ -12,7 +12,7 @@ import sys
 _FROZEN = getattr(sys, "frozen", False)
 
 try:
-    from PIL import Image, ImageTk, ImageDraw, ImageFont
+    from PIL import Image, ImageTk, ImageDraw, ImageFont, ImageOps
     import pypdfium2 as pdfium  # PDF 渲染（Apache/BSD，取代 PyMuPDF）
 except ImportError as _e:
     if _FROZEN:
@@ -27,7 +27,7 @@ except ImportError as _e:
     import subprocess
     subprocess.check_call([sys.executable, "-m", "pip", "install",
                            "pypdfium2", "Pillow"])
-    from PIL import Image, ImageTk, ImageDraw, ImageFont
+    from PIL import Image, ImageTk, ImageDraw, ImageFont, ImageOps
     import pypdfium2 as pdfium
 
 import io
@@ -447,6 +447,8 @@ class WinPreview(_Base):
         elif ext in IMG_EXTS:
             try:
                 img = Image.open(str(path))
+                # 手機照片常以 EXIF 標記方向，先轉正（標註座標以轉正後為準）
+                img = ImageOps.exif_transpose(img)
                 if img.mode not in ("RGB", "RGBA"):
                     img = img.convert("RGB")
                 else:
@@ -1698,13 +1700,23 @@ class WinPreview(_Base):
         W, H = sorted(size)
         return (H, W) if w > h else (W, H)
 
+    @staticmethod
+    def _exif_upright(path) -> bool:
+        """原檔像素是否本來就是正向；PDF 不認 EXIF 方向，被轉過的照片不能直接沿用原檔。"""
+        try:
+            with Image.open(str(path)) as im:
+                return im.getexif().get(0x0112, 1) == 1
+        except Exception:
+            return False
+
     def _image_reader(self, img: Image.Image, source_path, resized: bool):
         """挑選最省空間的嵌入方式：原 JPEG 直接沿用，其餘照片轉 JPEG，透明圖用 PNG。"""
         from reportlab.lib.utils import ImageReader
         if img.mode == "RGBA" and img.getextrema()[3][0] < 255:
             return ImageReader(img)                       # 有透明度 → 無損
         if (not resized and source_path is not None
-                and Path(source_path).suffix.lower() in (".jpg", ".jpeg")):
+                and Path(source_path).suffix.lower() in (".jpg", ".jpeg")
+                and self._exif_upright(source_path)):
             return ImageReader(str(source_path))          # 原檔 JPEG，不重新編碼
         buf = io.BytesIO()
         img.convert("RGB").save(buf, "JPEG", quality=JPEG_QUALITY, optimize=True)
